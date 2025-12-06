@@ -23,17 +23,16 @@ import 'package:uuid/uuid.dart';
 final FlutterLocalNotificationsPlugin flutterLocalNotificationsPlugin =
     FlutterLocalNotificationsPlugin();
 
-// שיניתי את ה-ID כדי להבטיח יצירה מחדש של הערוץ עם ההגדרות המעודכנות
-const String baseChannelId = 'critical_alert_loop_final'; 
-const String baseChannelName = 'אזעקה רציפה';
-const String channelDesc = 'משמיע סאונד בלופ עד לביטול ידני';
+const String baseChannelId = 'critical_alert_channel_v3'; 
+const String baseChannelName = 'התראות ביפר';
+const String channelDesc = 'ערוץ להתראות דחופות';
 
 const MethodChannel platformChannel = MethodChannel('com.example.alerts/ringtone');
 
 const int immediateNotificationId = 0; 
 
 // FLAG_INSISTENT = 4
-// זהו הדגל הקריטי שגורם לאנדרואיד לחזור על הסאונד שוב ושוב
+// דגל שגורם לאודיו לחזור על עצמו בלופ (כמו שיחה נכנסת)
 const int androidInsistentFlag = 4; 
 
 // -----------------------------------------------------------------------------
@@ -78,7 +77,7 @@ Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
   await Firebase.initializeApp();
   await AppLogger.log("BG_MSG", "Received: ${message.messageId}");
   
-  await _triggerInfiniteLoopLogic(
+  await _triggerAlertLogic(
     message.data['title'] ?? message.notification?.title ?? "הודעת ביפר",
     message.data['body'] ?? message.notification?.body ?? "התקבלה הודעה חדשה",
     shouldSaveHistory: true
@@ -112,15 +111,19 @@ Future<void> _configureLocalTimeZone() async {
 }
 
 // -----------------------------------------------------------------------------
-// INFINITE LOOP LOGIC (NO NAGGING, JUST ONE STRONG ALERT)
+// CORE ALERT LOGIC
 // -----------------------------------------------------------------------------
 
-Future<void> _triggerInfiniteLoopLogic(String title, String body, {required bool shouldSaveHistory}) async {
+Future<void> _triggerAlertLogic(String title, String body, {required bool shouldSaveHistory}) async {
   await _configureLocalTimeZone();
-  await AppLogger.log("ALERT", "Starting INFINITE LOOP: $title");
   
   final prefs = await SharedPreferences.getInstance();
   await prefs.reload();
+
+  // בדיקת הגדרות
+  bool isInsistentMode = prefs.getBool('is_insistent_mode') ?? true; // ברירת מחדל: רציף
+  
+  await AppLogger.log("ALERT", "Starting: $title (Mode: ${isInsistentMode ? 'Loop' : 'Single'})");
 
   // 1. שמירה בהיסטוריה
   if (shouldSaveHistory) {
@@ -137,7 +140,7 @@ Future<void> _triggerInfiniteLoopLogic(String title, String body, {required bool
     await prefs.setStringList('beeper_history', history);
   }
 
-  // 2. טעינת הגדרות (התעלמות מתדירות נדנוד כי אין יותר נדנוד)
+  // 2. טעינת העדפות נוספות
   bool isQuietTime = _checkQuietHours(prefs);
   bool isGlobalSilent = prefs.getBool('is_global_silent') ?? false;
   bool isVibrationEnabled = prefs.getBool('is_vibration_enabled') ?? true;
@@ -146,9 +149,9 @@ Future<void> _triggerInfiniteLoopLogic(String title, String body, {required bool
   AndroidNotificationDetails androidDetails;
   
   if (isQuietTime || isGlobalSilent) {
-    // מצב שקט: התראה רגילה ללא סאונד וללא לופ
+    // מצב שקט: התראה ויזואלית בלבד
     androidDetails = AndroidNotificationDetails(
-      'silent_channel_loop_v1',
+      'silent_channel_v2',
       'התראות שקטות',
       importance: Importance.high,
       priority: Priority.high,
@@ -168,7 +171,7 @@ Future<void> _triggerInfiniteLoopLogic(String title, String body, {required bool
         .resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>();
         
     try {
-      // מחיקת ערוץ ישן כדי לוודא שהגדרות האודיו (Alarm) יתפסו
+      // מחיקת ערוץ ישן כדי לוודא עדכון הגדרות
       await androidPlugin?.deleteNotificationChannel(currentChannelId);
 
       await androidPlugin?.createNotificationChannel(
@@ -180,7 +183,6 @@ Future<void> _triggerInfiniteLoopLogic(String title, String body, {required bool
           playSound: true,
           sound: soundObj, 
           enableVibration: isVibrationEnabled,
-          // חיוני: שימוש בערוץ Alarm עוקף מצבי "נא לא להפריע" סטנדרטיים
           audioAttributesUsage: AudioAttributesUsage.alarm, 
         )
       );
@@ -188,49 +190,56 @@ Future<void> _triggerInfiniteLoopLogic(String title, String body, {required bool
       await AppLogger.log("ERR_CHAN", "Channel create: $e");
     }
 
-    // הגדרת ההתראה ה"עקשנית"
+    // הגדרת ההתראה
     androidDetails = AndroidNotificationDetails(
       currentChannelId,
       baseChannelName,
       channelDescription: channelDesc,
       importance: Importance.max,
       priority: Priority.max,
-      fullScreenIntent: true, // קופץ למסך מלא אם המכשיר נעול
-      category: AndroidNotificationCategory.call, // מדמה שיחה נכנסת
+      fullScreenIntent: true,
       
-      // --- מנגנון הלופ ---
-      // שימוש ב-FLAG_INSISTENT (4) דרך additionalFlags
-      // זה גורם לאודיו לחזור על עצמו ללא הפסקה
-      additionalFlags: Int32List.fromList(<int>[androidInsistentFlag]),
+      // אם רציף: קטגוריית שיחה. אם רגיל: קטגוריית אזעקה.
+      category: isInsistentMode ? AndroidNotificationCategory.call : AndroidNotificationCategory.alarm,
       
-      // מניעת ביטול בטעות
-      ongoing: true,      // לא ניתן למחיקה בגרירה (Swipe)
-      autoCancel: false,  // לא נמחק בלחיצה רגילה
+      // --- לוגיקת הלופ ---
+      // אם המשתמש בחר "אזעקה רציפה" -> מוסיפים את הדגל 4
+      additionalFlags: isInsistentMode 
+          ? Int32List.fromList(<int>[androidInsistentFlag]) 
+          : null,
+      
+      // אם רציף -> לא ניתן למחיקה בגרירה (Ongoing). אחרת -> רגיל.
+      ongoing: isInsistentMode,
+      autoCancel: !isInsistentMode, // אם רציף, לא מתבטל בלחיצה אלא דורש פעולה
       
       visibility: NotificationVisibility.public,
       audioAttributesUsage: AudioAttributesUsage.alarm,
       playSound: true,
       sound: soundObj,
       enableVibration: isVibrationEnabled,
-      // רטט אגרסיבי: 2 שניות רטט, חצי שניה הפסקה
+      // רטט: אגרסיבי לרציף, רגיל לחד פעמי
       vibrationPattern: isVibrationEnabled 
-          ? Int64List.fromList([0, 2000, 500, 2000, 500, 2000, 500, 2000]) 
+          ? (isInsistentMode 
+              ? Int64List.fromList([0, 2000, 500, 2000, 500, 2000, 500, 2000]) // ארוך
+              : Int64List.fromList([0, 1000, 500, 1000])) // רגיל
           : null,
       
       actions: <AndroidNotificationAction>[
-        const AndroidNotificationAction(
-          'stop_action', 
-          'עצור אזעקה', // טקסט ברור לפעולה
-          showsUserInterface: true, 
-          cancelNotification: true // לחיצה כאן תעצור את הלופ
-        ),
+        // כפתור עצירה רלוונטי בעיקר למצב רציף
+        if (isInsistentMode)
+          const AndroidNotificationAction(
+            'stop_action', 
+            'עצור אזעקה', 
+            showsUserInterface: true, 
+            cancelNotification: true
+          ),
       ],
     );
   }
 
-  // 3. הצגת ההתראה (אין יותר תזמון עתידי, רק זה)
+  // 3. הצגת ההתראה
   try {
-    // אנו מבטלים התראות קודמות כדי למנוע התנגשות סאונד
+    // מבטלים התראות קודמות כדי למנוע התנגשויות סאונד במצב רציף
     await flutterLocalNotificationsPlugin.cancelAll();
 
     await flutterLocalNotificationsPlugin.show(
@@ -239,7 +248,7 @@ Future<void> _triggerInfiniteLoopLogic(String title, String body, {required bool
       body,
       NotificationDetails(android: androidDetails),
     );
-    await AppLogger.log("SHOW", "Infinite Loop Notification Started (Insistent)");
+    await AppLogger.log("SHOW", "Notification shown (Insistent: $isInsistentMode)");
   } catch (e) {
     await AppLogger.log("ERR_SHOW", "Show failed: $e");
   }
@@ -362,7 +371,7 @@ class _InitScreenState extends State<InitScreen> {
               AndroidFlutterLocalNotificationsPlugin>();
       
       await androidPlugin?.requestNotificationsPermission();
-      // אנו עדיין משאירים את ההרשאות האלו ליתר ביטחון, אך הן פחות קריטיות ללופ הרציף
+      // משאיר את הבקשה ליתר ביטחון, למרות שפחות קריטי בלי תזמונים
       await androidPlugin?.requestExactAlarmsPermission();
     }
   }
@@ -402,7 +411,7 @@ class _BeeperScreenState extends State<BeeperScreen> with WidgetsBindingObserver
     
     FirebaseMessaging.onMessage.listen((msg) {
       AppLogger.log("FG_MSG", "Msg received in foreground");
-      _triggerInfiniteLoopLogic(
+      _triggerAlertLogic(
         msg.data['title'] ?? msg.notification?.title ?? "הודעה",
         msg.data['body'] ?? msg.notification?.body ?? "תוכן הודעה",
         shouldSaveHistory: true 
@@ -467,9 +476,9 @@ class _BeeperScreenState extends State<BeeperScreen> with WidgetsBindingObserver
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(content: Text("מבצע בדיקה..."), duration: Duration(seconds: 1))
     );
-    await _triggerInfiniteLoopLogic(
+    await _triggerAlertLogic(
       "בדיקה עצמית", 
-      "בדיקת אזעקה רציפה (לופ אינסופי)",
+      "בדיקת אזעקה (הגדרות נוכחיות)",
       shouldSaveHistory: true 
     );
     _loadMessages();
@@ -672,7 +681,6 @@ class _PermissionsDialogState extends State<PermissionsDialog> {
 
   Future<void> _check() async {
     final n = await Permission.notification.status;
-    // עדיין בודקים את ההרשאה ליתר ביטחון, למרות שאינה קריטית ללופ ללא תזמון
     final a = await Permission.scheduleExactAlarm.status;
     final b = await Permission.ignoreBatteryOptimizations.status;
     
@@ -706,7 +714,7 @@ class _PermissionsDialogState extends State<PermissionsDialog> {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             _buildRow("התראות", Permission.notification),
-            _buildRow("תזמון מדויק (מומלץ)", Permission.scheduleExactAlarm),
+            _buildRow("תזמון מדויק (לא קריטי)", Permission.scheduleExactAlarm),
             _buildRow("החרגת סוללה", Permission.ignoreBatteryOptimizations),
             
             const SizedBox(height: 15),
@@ -843,7 +851,7 @@ class _SettingsPageState extends State<SettingsPage> {
   int _start = -1, _end = -1;
   bool _isGlobalSilent = false;
   bool _isVibrationEnabled = true;
-  int _frequencySeconds = 60;
+  bool _isInsistentMode = true; // ברירת מחדל: לופ
   String? _soundUri;
 
   @override
@@ -860,7 +868,7 @@ class _SettingsPageState extends State<SettingsPage> {
       _end = prefs.getInt('quiet_end_hour') ?? -1;
       _isGlobalSilent = prefs.getBool('is_global_silent') ?? false;
       _isVibrationEnabled = prefs.getBool('is_vibration_enabled') ?? true;
-      _frequencySeconds = prefs.getInt('nag_frequency_seconds') ?? 60;
+      _isInsistentMode = prefs.getBool('is_insistent_mode') ?? true;
       _soundUri = prefs.getString('custom_sound_uri');
     });
   }
@@ -886,12 +894,10 @@ class _SettingsPageState extends State<SettingsPage> {
     setState(() => _isVibrationEnabled = val);
   }
 
-  Future<void> _setFrequency(int? val) async {
-    if (val != null) {
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.setInt('nag_frequency_seconds', val);
-      setState(() => _frequencySeconds = val);
-    }
+  Future<void> _toggleInsistent(bool val) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('is_insistent_mode', val);
+    setState(() => _isInsistentMode = val);
   }
 
   Future<void> _openSystemRingtonePicker() async {
@@ -935,30 +941,27 @@ class _SettingsPageState extends State<SettingsPage> {
                   activeColor: Colors.greenAccent,
                 ),
                 const Divider(color: Colors.grey),
+                
+                // --- הגדרה חדשה במקום נדנוד ---
+                SwitchListTile(
+                  title: const Text("אזעקה רציפה (לופ)", style: TextStyle(color: Colors.white)),
+                  subtitle: const Text("מצלצל עד שמפסיקים ידנית. כבוי = צלצול יחיד."),
+                  value: _isInsistentMode,
+                  onChanged: _toggleInsistent,
+                  activeColor: Colors.redAccent, // צבע אדום להדגשת חשיבות
+                  secondary: Icon(
+                    _isInsistentMode ? Icons.loop : Icons.notifications_none,
+                    color: _isInsistentMode ? Colors.redAccent : Colors.grey,
+                  ),
+                ),
+                
+                const Divider(color: Colors.grey),
                 SwitchListTile(
                   title: const Text("רטט", style: TextStyle(color: Colors.white)),
                   subtitle: const Text("הפעל רטט בעת קבלת התראה"),
                   value: _isVibrationEnabled,
                   onChanged: _toggleVibration,
                   activeColor: Colors.greenAccent,
-                ),
-                const Divider(color: Colors.grey),
-                // שמרתי את ההגדרה בתצוגה אך היא לא עושה כלום כרגע כי אין תזמון
-                ListTile(
-                  title: const Text("תדירות נדנוד", style: TextStyle(color: Colors.grey)), // צבע אפור כי לא פעיל
-                  subtitle: const Text("לא בשימוש (מצב לופ רציף)"),
-                  trailing: DropdownButton<int>(
-                    value: _frequencySeconds,
-                    dropdownColor: Colors.grey[900],
-                    style: const TextStyle(color: Colors.grey),
-                    items: const [
-                      DropdownMenuItem(value: 30, child: Text("30 שניות")),
-                      DropdownMenuItem(value: 60, child: Text("1 דקה")),
-                      DropdownMenuItem(value: 120, child: Text("2 דקות")),
-                      DropdownMenuItem(value: 300, child: Text("5 דקות")),
-                    ],
-                    onChanged: _setFrequency, // משאיר את הפונקציונליות כדי לא לשבור קוד, אבל זה לא ישפיע
-                  ),
                 ),
               ],
             ),
