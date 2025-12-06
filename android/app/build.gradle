@@ -26,7 +26,7 @@ if (flutterVersionName == null) {
 android {
     namespace "com.example.alerts"
     compileSdkVersion 34
-    // הגדרה קריטית למניעת שגיאות בנייה
+    // FIX: Set specific NDK version to prevent GitHub Actions failures
     ndkVersion "25.1.8937393"
 
     compileOptions {
@@ -49,6 +49,7 @@ android {
         targetSdkVersion 34
         versionCode flutterVersionCode.toInteger()
         versionName flutterVersionName
+        
         multiDexEnabled true
     }
 
