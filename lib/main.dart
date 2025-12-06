@@ -39,12 +39,14 @@ class AppLogger {
   static Future<void> log(String type, String message) async {
     try {
       final prefs = await SharedPreferences.getInstance();
+      // Force reload to ensure logs aren't overwritten by stale instances
+      await prefs.reload(); 
       List<String> logs = prefs.getStringList(_key) ?? [];
       
       final timestamp = DateFormat('dd/MM HH:mm:ss').format(DateTime.now());
       final entry = "$timestamp [$type] $message";
       
-      // Keep only last 200 logs to save memory
+      // Keep only last 200 logs
       logs.insert(0, entry);
       if (logs.length > 200) logs = logs.sublist(0, 200);
       
@@ -57,6 +59,7 @@ class AppLogger {
 
   static Future<List<String>> getLogs() async {
     final prefs = await SharedPreferences.getInstance();
+    await prefs.reload();
     return prefs.getStringList(_key) ?? [];
   }
 }
@@ -70,9 +73,11 @@ Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
   await Firebase.initializeApp();
   await AppLogger.log("BG_MSG", "Received: ${message.messageId}");
   
+  // הודעה חדשה מבחוץ -> שומרים בהיסטוריה
   await _triggerNaggingLogic(
     message.data['title'] ?? message.notification?.title ?? "הודעת ביפר",
-    message.data['body'] ?? message.notification?.body ?? "התקבלה הודעה חדשה"
+    message.data['body'] ?? message.notification?.body ?? "התקבלה הודעה חדשה",
+    shouldSaveHistory: true
   );
 }
 
@@ -103,38 +108,47 @@ Future<void> _configureLocalTimeZone() async {
 }
 
 // -----------------------------------------------------------------------------
-// NAGGING LOGIC
+// NAGGING LOGIC (THE ENGINE)
 // -----------------------------------------------------------------------------
 
-Future<void> _triggerNaggingLogic(String title, String body) async {
+Future<void> _triggerNaggingLogic(String title, String body, {required bool shouldSaveHistory}) async {
+  // 1. Setup Environment
   await _configureLocalTimeZone();
-  await AppLogger.log("ALERT", "Starting logic for: $title");
+  await AppLogger.log("ALERT", "Starting logic for: $title (Save=$shouldSaveHistory)");
+  
   final prefs = await SharedPreferences.getInstance();
-  
-  // 1. History Save
-  final messageData = {
-    'id': const Uuid().v4(),
-    'title': title,
-    'body': body,
-    'timestamp': DateTime.now().toIso8601String(),
-    'read': false,
-  };
-  
-  List<String> history = prefs.getStringList('beeper_history') ?? [];
-  history.insert(0, jsonEncode(messageData));
-  await prefs.setStringList('beeper_history', history);
+  // CRITICAL FIX: Reload prefs to ensure we see the latest settings (like 30s) changed from UI
+  await prefs.reload();
 
-  // 2. User Settings
+  // 2. Save History (Only if requested - prevents duplication on test/repeats)
+  if (shouldSaveHistory) {
+    final messageData = {
+      'id': const Uuid().v4(),
+      'title': title,
+      'body': body,
+      'timestamp': DateTime.now().toIso8601String(),
+      'read': false,
+    };
+    
+    List<String> history = prefs.getStringList('beeper_history') ?? [];
+    history.insert(0, jsonEncode(messageData));
+    await prefs.setStringList('beeper_history', history);
+  }
+
+  // 3. Load Settings
   bool isQuietTime = _checkQuietHours(prefs);
   bool isGlobalSilent = prefs.getBool('is_global_silent') ?? false;
   bool isVibrationEnabled = prefs.getBool('is_vibration_enabled') ?? true;
 
+  // Debugging the frequency issue
   int frequencySeconds = prefs.getInt('nag_frequency_seconds') ?? 60;
+  await AppLogger.log("DEBUG", "Frequency set to: $frequencySeconds seconds");
+
   String? customSoundUri = prefs.getString('custom_sound_uri');
   
   AndroidNotificationDetails androidDetails;
   
-  // 3. Build Channel
+  // 4. Build Channel Configuration
   if (isQuietTime || isGlobalSilent) {
     androidDetails = AndroidNotificationDetails(
       'silent_channel_prod',
@@ -180,7 +194,7 @@ Future<void> _triggerNaggingLogic(String title, String body) async {
       channelDescription: channelDesc,
       importance: Importance.max,
       priority: Priority.max,
-      fullScreenIntent: true,
+      fullScreenIntent: true, // This wakes the screen
       category: AndroidNotificationCategory.alarm,
       visibility: NotificationVisibility.public,
       audioAttributesUsage: AudioAttributesUsage.alarm,
@@ -193,10 +207,10 @@ Future<void> _triggerNaggingLogic(String title, String body) async {
     );
   }
 
-  // 4. Immediate Notification
+  // 5. Fire Immediate Notification (The "First Press")
   try {
     await flutterLocalNotificationsPlugin.show(
-      0,
+      0, // ID 0 is the main alert
       title,
       body,
       NotificationDetails(android: androidDetails),
@@ -205,20 +219,29 @@ Future<void> _triggerNaggingLogic(String title, String body) async {
     await AppLogger.log("ERR_SHOW", "Show immediate: $e");
   }
 
-  // 5. Schedule Repetitions
+  // 6. Schedule Repeats (The "Nagging")
+  // These are scheduled native alarms. They will fire purely natively.
+  // We use the EXACT SAME androidDetails so they also wake screen and make noise.
   if (!isQuietTime && !isGlobalSilent) {
     try {
+      // Cancel previous schedules to prevent overlap
+      await flutterLocalNotificationsPlugin.cancel(1);
+      await flutterLocalNotificationsPlugin.cancel(2);
+      await flutterLocalNotificationsPlugin.cancel(3);
+      await flutterLocalNotificationsPlugin.cancel(4);
+      await flutterLocalNotificationsPlugin.cancel(5);
+
       final now = tz.TZDateTime.now(tz.local);
       for (int i = 1; i <= 5; i++) {
         final scheduledTime = now.add(Duration(seconds: i * frequencySeconds));
         
         await flutterLocalNotificationsPlugin.zonedSchedule(
-          i + 100,
+          i, // IDs 1-5 for repeats
           "$title (חזרה $i)",
           body,
           scheduledTime,
-          NotificationDetails(android: androidDetails),
-          androidScheduleMode: AndroidScheduleMode.alarmClock,
+          NotificationDetails(android: androidDetails), // Re-use exact configuration
+          androidScheduleMode: AndroidScheduleMode.alarmClock, // Critical for timing
           uiLocalNotificationDateInterpretation:
               UILocalNotificationDateInterpretation.absoluteTime,
         );
@@ -374,7 +397,8 @@ class _BeeperScreenState extends State<BeeperScreen> with WidgetsBindingObserver
       AppLogger.log("FG_MSG", "Msg received in foreground");
       _triggerNaggingLogic(
         msg.data['title'] ?? msg.notification?.title ?? "הודעה",
-        msg.data['body'] ?? msg.notification?.body ?? "תוכן הודעה"
+        msg.data['body'] ?? msg.notification?.body ?? "תוכן הודעה",
+        shouldSaveHistory: true
       );
       _loadMessages();
     });
@@ -404,6 +428,7 @@ class _BeeperScreenState extends State<BeeperScreen> with WidgetsBindingObserver
 
   Future<void> _loadMessages() async {
     final prefs = await SharedPreferences.getInstance();
+    await prefs.reload(); // Ensure we see fresh history
     final history = prefs.getStringList('beeper_history') ?? [];
     setState(() {
       _messages = history.map((e) => jsonDecode(e) as Map<String, dynamic>).toList();
@@ -415,6 +440,7 @@ class _BeeperScreenState extends State<BeeperScreen> with WidgetsBindingObserver
     AppLogger.log("ACTION", "User stopped beeper");
     
     final prefs = await SharedPreferences.getInstance();
+    await prefs.reload();
     List<String> history = prefs.getStringList('beeper_history') ?? [];
     List<String> updated = [];
     for (var item in history) {
@@ -430,6 +456,7 @@ class _BeeperScreenState extends State<BeeperScreen> with WidgetsBindingObserver
     );
   }
 
+  // --- תיקון: בדיקה עצמית ללא שכפול הודעות ---
   Future<void> _runSelfTest() async {
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(
@@ -437,7 +464,12 @@ class _BeeperScreenState extends State<BeeperScreen> with WidgetsBindingObserver
         duration: Duration(seconds: 1)
       )
     );
-    await _triggerNaggingLogic("בדיקה עצמית", "בדיקת מערכת סאונד והתראות");
+    // Passing false so we don't spam history with test messages
+    await _triggerNaggingLogic(
+      "בדיקה עצמית", 
+      "בדיקת מערכת סאונד והתראות",
+      shouldSaveHistory: false 
+    );
     _loadMessages();
   }
 
@@ -608,7 +640,7 @@ class _BeeperScreenState extends State<BeeperScreen> with WidgetsBindingObserver
 }
 
 // -----------------------------------------------------------------------------
-// DYNAMIC PERMISSIONS DIALOG
+// DYNAMIC PERMISSIONS DIALOG (WITH AUTO-REFRESH TIMER)
 // -----------------------------------------------------------------------------
 
 class PermissionsDialog extends StatefulWidget {
@@ -618,29 +650,23 @@ class PermissionsDialog extends StatefulWidget {
   State<PermissionsDialog> createState() => _PermissionsDialogState();
 }
 
-class _PermissionsDialogState extends State<PermissionsDialog> with WidgetsBindingObserver {
+class _PermissionsDialogState extends State<PermissionsDialog> {
   Map<Permission, PermissionStatus> _statuses = {};
   bool _loading = true;
+  Timer? _refreshTimer;
 
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addObserver(this);
     _check();
+    // בדיקה אגרסיבית: רענון כל שנייה כדי לתפוס שינויים בזמן אמת
+    _refreshTimer = Timer.periodic(const Duration(seconds: 1), (_) => _check());
   }
 
   @override
   void dispose() {
-    WidgetsBinding.instance.removeObserver(this);
+    _refreshTimer?.cancel();
     super.dispose();
-  }
-
-  // זו הנקודה הקריטית: כשחוזרים לאפליקציה (למשל מההגדרות), בודקים שוב
-  @override
-  void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed) {
-      _check();
-    }
   }
 
   Future<void> _check() async {
@@ -722,11 +748,9 @@ class _PermissionsDialogState extends State<PermissionsDialog> with WidgetsBindi
                 onPressed: () async {
                   if (isPermanentlyDenied) {
                     await openAppSettings();
-                    // אנחנו לא מרעננים כאן ידנית, כי ה-Listener ב-didChangeAppLifecycleState
-                    // יזהה את החזרה לאפליקציה וירענן לבד!
                   } else {
                     await perm.request();
-                    _check(); // רענון מידי במקרה של דיאלוג פנימי
+                    // הטיימר כבר יתפוס את השינוי
                   }
                 },
                 child: Text(
@@ -824,6 +848,7 @@ class _SettingsPageState extends State<SettingsPage> {
 
   Future<void> _load() async {
     final prefs = await SharedPreferences.getInstance();
+    await prefs.reload(); // Ensure fresh load
     setState(() {
       _start = prefs.getInt('quiet_start_hour') ?? -1;
       _end = prefs.getInt('quiet_end_hour') ?? -1;
