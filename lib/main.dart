@@ -39,14 +39,12 @@ class AppLogger {
   static Future<void> log(String type, String message) async {
     try {
       final prefs = await SharedPreferences.getInstance();
-      // Force reload to ensure logs aren't overwritten by stale instances
       await prefs.reload(); 
       List<String> logs = prefs.getStringList(_key) ?? [];
       
       final timestamp = DateFormat('dd/MM HH:mm:ss').format(DateTime.now());
       final entry = "$timestamp [$type] $message";
       
-      // Keep only last 200 logs
       logs.insert(0, entry);
       if (logs.length > 200) logs = logs.sublist(0, 200);
       
@@ -73,7 +71,7 @@ Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
   await Firebase.initializeApp();
   await AppLogger.log("BG_MSG", "Received: ${message.messageId}");
   
-  // הודעה חדשה מבחוץ -> שומרים בהיסטוריה
+  // הודעה חדשה מבחוץ -> שומרים בהיסטוריה (true)
   await _triggerNaggingLogic(
     message.data['title'] ?? message.notification?.title ?? "הודעת ביפר",
     message.data['body'] ?? message.notification?.body ?? "התקבלה הודעה חדשה",
@@ -112,15 +110,13 @@ Future<void> _configureLocalTimeZone() async {
 // -----------------------------------------------------------------------------
 
 Future<void> _triggerNaggingLogic(String title, String body, {required bool shouldSaveHistory}) async {
-  // 1. Setup Environment
   await _configureLocalTimeZone();
-  await AppLogger.log("ALERT", "Starting logic for: $title (Save=$shouldSaveHistory)");
+  await AppLogger.log("ALERT", "Starting logic: $title (Save=$shouldSaveHistory)");
   
   final prefs = await SharedPreferences.getInstance();
-  // CRITICAL FIX: Reload prefs to ensure we see the latest settings (like 30s) changed from UI
-  await prefs.reload();
+  await prefs.reload(); // קריטי לסנכרון הגדרות והיסטוריה
 
-  // 2. Save History (Only if requested - prevents duplication on test/repeats)
+  // 1. שמירה בהיסטוריה (רק אם זו ההודעה הראשונית)
   if (shouldSaveHistory) {
     final messageData = {
       'id': const Uuid().v4(),
@@ -135,20 +131,16 @@ Future<void> _triggerNaggingLogic(String title, String body, {required bool shou
     await prefs.setStringList('beeper_history', history);
   }
 
-  // 3. Load Settings
+  // 2. טעינת הגדרות
   bool isQuietTime = _checkQuietHours(prefs);
   bool isGlobalSilent = prefs.getBool('is_global_silent') ?? false;
   bool isVibrationEnabled = prefs.getBool('is_vibration_enabled') ?? true;
-
-  // Debugging the frequency issue
   int frequencySeconds = prefs.getInt('nag_frequency_seconds') ?? 60;
-  await AppLogger.log("DEBUG", "Frequency set to: $frequencySeconds seconds");
-
   String? customSoundUri = prefs.getString('custom_sound_uri');
   
   AndroidNotificationDetails androidDetails;
   
-  // 4. Build Channel Configuration
+  // 3. בניית ערוץ ההתראה
   if (isQuietTime || isGlobalSilent) {
     androidDetails = AndroidNotificationDetails(
       'silent_channel_prod',
@@ -158,10 +150,8 @@ Future<void> _triggerNaggingLogic(String title, String body, {required bool shou
       playSound: false,
       enableVibration: isVibrationEnabled,
     );
-    await AppLogger.log("MODE", "Silent mode active");
   } else {
     String currentChannelId = baseChannelId;
-    
     AndroidNotificationSound? soundObj;
     if (customSoundUri != null && customSoundUri.isNotEmpty) {
       currentChannelId = "${baseChannelId}_${customSoundUri.hashCode}";
@@ -194,7 +184,7 @@ Future<void> _triggerNaggingLogic(String title, String body, {required bool shou
       channelDescription: channelDesc,
       importance: Importance.max,
       priority: Priority.max,
-      fullScreenIntent: true, // This wakes the screen
+      fullScreenIntent: true,
       category: AndroidNotificationCategory.alarm,
       visibility: NotificationVisibility.public,
       audioAttributesUsage: AudioAttributesUsage.alarm,
@@ -207,10 +197,10 @@ Future<void> _triggerNaggingLogic(String title, String body, {required bool shou
     );
   }
 
-  // 5. Fire Immediate Notification (The "First Press")
+  // 4. התראה מיידית (ID 0)
   try {
     await flutterLocalNotificationsPlugin.show(
-      0, // ID 0 is the main alert
+      0, 
       title,
       body,
       NotificationDetails(android: androidDetails),
@@ -219,29 +209,23 @@ Future<void> _triggerNaggingLogic(String title, String body, {required bool shou
     await AppLogger.log("ERR_SHOW", "Show immediate: $e");
   }
 
-  // 6. Schedule Repeats (The "Nagging")
-  // These are scheduled native alarms. They will fire purely natively.
-  // We use the EXACT SAME androidDetails so they also wake screen and make noise.
+  // 5. תזמון חזרות (נודניק)
   if (!isQuietTime && !isGlobalSilent) {
     try {
-      // Cancel previous schedules to prevent overlap
-      await flutterLocalNotificationsPlugin.cancel(1);
-      await flutterLocalNotificationsPlugin.cancel(2);
-      await flutterLocalNotificationsPlugin.cancel(3);
-      await flutterLocalNotificationsPlugin.cancel(4);
-      await flutterLocalNotificationsPlugin.cancel(5);
+      // ביטול תזמונים קודמים כדי למנוע כפילויות
+      await flutterLocalNotificationsPlugin.cancel(1); 
 
       final now = tz.TZDateTime.now(tz.local);
       for (int i = 1; i <= 5; i++) {
         final scheduledTime = now.add(Duration(seconds: i * frequencySeconds));
         
         await flutterLocalNotificationsPlugin.zonedSchedule(
-          i, // IDs 1-5 for repeats
-          "$title (חזרה $i)",
+          1, // שימוש באותו ID (1) לכל החזרות כדי שידרסו זו את זו ולא יערמו
+          "$title (נודניק $i)",
           body,
           scheduledTime,
-          NotificationDetails(android: androidDetails), // Re-use exact configuration
-          androidScheduleMode: AndroidScheduleMode.alarmClock, // Critical for timing
+          NotificationDetails(android: androidDetails), 
+          androidScheduleMode: AndroidScheduleMode.alarmClock,
           uiLocalNotificationDateInterpretation:
               UILocalNotificationDateInterpretation.absoluteTime,
         );
@@ -398,7 +382,7 @@ class _BeeperScreenState extends State<BeeperScreen> with WidgetsBindingObserver
       _triggerNaggingLogic(
         msg.data['title'] ?? msg.notification?.title ?? "הודעה",
         msg.data['body'] ?? msg.notification?.body ?? "תוכן הודעה",
-        shouldSaveHistory: true
+        shouldSaveHistory: true // הודעה אמיתית - לשמור!
       );
       _loadMessages();
     });
@@ -428,7 +412,7 @@ class _BeeperScreenState extends State<BeeperScreen> with WidgetsBindingObserver
 
   Future<void> _loadMessages() async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.reload(); // Ensure we see fresh history
+    await prefs.reload(); // טעינה מחדש קריטית לעדכון מהיר של המסך
     final history = prefs.getStringList('beeper_history') ?? [];
     setState(() {
       _messages = history.map((e) => jsonDecode(e) as Map<String, dynamic>).toList();
@@ -456,19 +440,15 @@ class _BeeperScreenState extends State<BeeperScreen> with WidgetsBindingObserver
     );
   }
 
-  // --- תיקון: בדיקה עצמית ללא שכפול הודעות ---
   Future<void> _runSelfTest() async {
     ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(
-        content: Text("הרשאה: בדיקה בביצוע..."), 
-        duration: Duration(seconds: 1)
-      )
+      const SnackBar(content: Text("מבצע בדיקה..."), duration: Duration(seconds: 1))
     );
-    // Passing false so we don't spam history with test messages
+    // בדיקה יזומה - לשמור בהיסטוריה! (true)
     await _triggerNaggingLogic(
       "בדיקה עצמית", 
       "בדיקת מערכת סאונד והתראות",
-      shouldSaveHistory: false 
+      shouldSaveHistory: true 
     );
     _loadMessages();
   }
@@ -659,7 +639,6 @@ class _PermissionsDialogState extends State<PermissionsDialog> {
   void initState() {
     super.initState();
     _check();
-    // בדיקה אגרסיבית: רענון כל שנייה כדי לתפוס שינויים בזמן אמת
     _refreshTimer = Timer.periodic(const Duration(seconds: 1), (_) => _check());
   }
 
@@ -710,7 +689,7 @@ class _PermissionsDialogState extends State<PermissionsDialog> {
             const SizedBox(height: 15),
             if (_statuses[Permission.ignoreBatteryOptimizations] != PermissionStatus.granted)
                const Text(
-                "הערה: 'החרגת סוללה' קריטית לקבלת התראות כשהמסך כבוי.",
+                "חשוב: עבור הרשאת סוללה, יש לבחור 'ללא הגבלה' (Unrestricted) בהגדרות האפליקציה.",
                 style: TextStyle(color: Colors.orange, fontSize: 12),
               ),
           ],
@@ -728,8 +707,9 @@ class _PermissionsDialogState extends State<PermissionsDialog> {
   Widget _buildRow(String name, Permission perm) {
     final status = _statuses[perm] ?? PermissionStatus.denied;
     bool isOk = status == PermissionStatus.granted;
-    bool isPermanentlyDenied = status.isPermanentlyDenied || status.isRestricted;
-
+    // עבור סוללה, באנדרואיד לעיתים קרובות הסטטוס מדווח כ-Denied גם כשאפשר לבקש
+    // לכן אנו מאפשרים ללחוץ על הכפתור תמיד אם זה לא Granted
+    
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 8.0),
       child: Row(
@@ -742,20 +722,28 @@ class _PermissionsDialogState extends State<PermissionsDialog> {
               height: 30,
               child: ElevatedButton(
                 style: ElevatedButton.styleFrom(
-                  backgroundColor: isPermanentlyDenied ? Colors.orange : Colors.greenAccent, 
+                  backgroundColor: Colors.greenAccent, 
                   padding: const EdgeInsets.symmetric(horizontal: 8)
                 ),
                 onPressed: () async {
-                  if (isPermanentlyDenied) {
-                    await openAppSettings();
+                  // לוגיקה משופרת: אם הבקשה נכשלת או שזו סוללה, פתח הגדרות ישירות
+                  if (perm == Permission.ignoreBatteryOptimizations) {
+                     // ניסיון ראשון לבקשה סטנדרטית
+                     final result = await perm.request();
+                     if (result != PermissionStatus.granted) {
+                       await openAppSettings();
+                     }
                   } else {
-                    await perm.request();
-                    // הטיימר כבר יתפוס את השינוי
+                    final result = await perm.request();
+                    if (result.isPermanentlyDenied) {
+                      await openAppSettings();
+                    }
                   }
+                  // הטיימר ירענן את המצב
                 },
-                child: Text(
-                  isPermanentlyDenied ? "הגדרות" : "אשר", 
-                  style: const TextStyle(color: Colors.black, fontSize: 12)
+                child: const Text(
+                  "אשר / הגדרות", 
+                  style: TextStyle(color: Colors.black, fontSize: 12)
                 ),
               ),
             )
