@@ -17,7 +17,8 @@ dependencies:
   firebase_messaging: ^14.7.15
   flutter_local_notifications: ^17.1.0
   
-  # הוסר: file_picker (משתמשים כעת בבורר המערכת המובנה)
+  # חובה עבור נודניק מדויק (מונע את הבעיה שהתראות לא מופיעות)
+  flutter_timezone: ^1.0.8
   
   # Utilities
   shared_preferences: ^2.2.2
