@@ -23,16 +23,16 @@ import 'package:uuid/uuid.dart';
 final FlutterLocalNotificationsPlugin flutterLocalNotificationsPlugin =
     FlutterLocalNotificationsPlugin();
 
-const String baseChannelId = 'critical_alert_channel_prod';
-const String baseChannelName = 'התראות חירום';
-const String channelDesc = 'ערוץ להודעות דחופות עם עקיפת שקט';
+// שיניתי את שם הערוץ כדי להכריח את אנדרואיד ליצור הגדרות סאונד חדשות
+const String baseChannelId = 'critical_alert_insistent_v1';
+const String baseChannelName = 'אזעקת חירום';
+const String channelDesc = 'התראות בלופ אינסופי עד למענה';
 
 const MethodChannel platformChannel = MethodChannel('com.example.alerts/ringtone');
 
-// הגדרות למנגנון הנדנוד המתוקן
-const int immediateNotificationId = 0; // ID להתראה הראשונה
-const int nagBaseNotificationId = 1000; // בסיס להתראות הנודניק (1001, 1002...)
-const int nagRepeatCount = 5; // כמה פעמים לנדנד
+const int immediateNotificationId = 0; 
+const int nagBaseNotificationId = 1000;
+const int nagRepeatCount = 5; 
 
 // -----------------------------------------------------------------------------
 // LOGGING SYSTEM
@@ -76,7 +76,6 @@ Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
   await Firebase.initializeApp();
   await AppLogger.log("BG_MSG", "Received: ${message.messageId}");
   
-  // הודעה חדשה מבחוץ -> שומרים בהיסטוריה (true)
   await _triggerNaggingLogic(
     message.data['title'] ?? message.notification?.title ?? "הודעת ביפר",
     message.data['body'] ?? message.notification?.body ?? "התקבלה הודעה חדשה",
@@ -111,7 +110,7 @@ Future<void> _configureLocalTimeZone() async {
 }
 
 // -----------------------------------------------------------------------------
-// NAGGING LOGIC (THE ENGINE) - FIXED VERSION
+// NAGGING LOGIC (THE ENGINE) - INSISTENT MODE
 // -----------------------------------------------------------------------------
 
 Future<void> _triggerNaggingLogic(String title, String body, {required bool shouldSaveHistory}) async {
@@ -119,9 +118,9 @@ Future<void> _triggerNaggingLogic(String title, String body, {required bool shou
   await AppLogger.log("ALERT", "Starting logic: $title (Save=$shouldSaveHistory)");
   
   final prefs = await SharedPreferences.getInstance();
-  await prefs.reload(); // קריטי לסנכרון הגדרות והיסטוריה
+  await prefs.reload();
 
-  // 1. שמירה בהיסטוריה (רק אם זו ההודעה הראשונית)
+  // 1. שמירה בהיסטוריה
   if (shouldSaveHistory) {
     final messageData = {
       'id': const Uuid().v4(),
@@ -145,10 +144,10 @@ Future<void> _triggerNaggingLogic(String title, String body, {required bool shou
   
   AndroidNotificationDetails androidDetails;
   
-  // 3. בניית ערוץ ההתראה
   if (isQuietTime || isGlobalSilent) {
+    // במצב שקט - אין סאונד
     androidDetails = AndroidNotificationDetails(
-      'silent_channel_prod',
+      'silent_channel_v1',
       'התראות שקטות',
       importance: Importance.high,
       priority: Priority.high,
@@ -158,31 +157,38 @@ Future<void> _triggerNaggingLogic(String title, String body, {required bool shou
   } else {
     String currentChannelId = baseChannelId;
     AndroidNotificationSound? soundObj;
+    
+    // אם אין סאונד מותאם אישית, נשתמש בסאונד ברירת מחדל של *שעון מעורר* (חזק יותר)
     if (customSoundUri != null && customSoundUri.isNotEmpty) {
       currentChannelId = "${baseChannelId}_${customSoundUri.hashCode}";
       soundObj = UriAndroidNotificationSound(customSoundUri);
-    }
+    } 
 
     final androidPlugin = flutterLocalNotificationsPlugin
         .resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>();
         
     try {
+      // מחיקת הערוץ הישן כדי להבטיח שהגדרות הסאונד יתפסו
+      await androidPlugin?.deleteNotificationChannel(currentChannelId);
+      
       await androidPlugin?.createNotificationChannel(
         AndroidNotificationChannel(
           currentChannelId,
           baseChannelName,
           description: channelDesc,
-          importance: Importance.max,
+          importance: Importance.max, // מקסימלי
           playSound: true,
           sound: soundObj, 
           enableVibration: isVibrationEnabled,
-          audioAttributesUsage: AudioAttributesUsage.alarm,
+          // שינוי קריטי: שימוש בערוץ אודיו של אזעקה, לא של התראות
+          audioAttributesUsage: AudioAttributesUsage.alarm, 
         )
       );
     } catch (e) {
       await AppLogger.log("ERR_CHAN", "Channel create: $e");
     }
 
+    // הגדרות "אלימות" להתראה
     androidDetails = AndroidNotificationDetails(
       currentChannelId,
       baseChannelName,
@@ -190,15 +196,32 @@ Future<void> _triggerNaggingLogic(String title, String body, {required bool shou
       importance: Importance.max,
       priority: Priority.max,
       fullScreenIntent: true,
-      category: AndroidNotificationCategory.alarm,
+      
+      // שינוי 1: קטגוריית "שיחה" גורמת לאנדרואיד להתייחס לזה בדחיפות עליונה
+      category: AndroidNotificationCategory.call,
+      
+      // שינוי 2: המפתח להצלחה - הסאונד יחזור על עצמו בלופ עד שהמשתמש יגיב
+      insistent: true,
+      
+      // שינוי 3: ההתראה לא נמחקת בגרירה
+      ongoing: true,
+      autoCancel: false,
+      
       visibility: NotificationVisibility.public,
       audioAttributesUsage: AudioAttributesUsage.alarm,
       playSound: true,
       sound: soundObj,
       enableVibration: isVibrationEnabled,
+      // דפוס רטט אגרסיבי יותר (ארוך-קצר-ארוך)
       vibrationPattern: isVibrationEnabled 
-          ? Int64List.fromList([0, 1000, 500, 1000, 500, 1000]) 
+          ? Int64List.fromList([0, 2000, 500, 2000, 500, 2000]) 
           : null,
+      
+      // דגל נוסף שעוזר לעקוף מצבי חיסכון סוללה
+      actions: <AndroidNotificationAction>[
+        const AndroidNotificationAction('stop_action', 'עצור צפצוף',
+            showsUserInterface: true, cancelNotification: true),
+      ],
     );
   }
 
@@ -210,15 +233,14 @@ Future<void> _triggerNaggingLogic(String title, String body, {required bool shou
       body,
       NotificationDetails(android: androidDetails),
     );
-    await AppLogger.log("SHOW", "Immediate notification shown");
+    await AppLogger.log("SHOW", "Immediate INSISTENT notification shown");
   } catch (e) {
     await AppLogger.log("ERR_SHOW", "Show immediate: $e");
   }
 
-  // 5. תזמון חזרות (נודניק) - מתוקן
+  // 5. תזמון חזרות (גיבוי למקרה שהמשתמש השתיק את הלופ עם כפתור הווליום)
   if (!isQuietTime && !isGlobalSilent) {
     try {
-      // ניקוי תזמונים קודמים כדי למנוע חפיפות
       for (int i = 1; i <= nagRepeatCount; i++) {
         await flutterLocalNotificationsPlugin.cancel(nagBaseNotificationId + i);
       }
@@ -231,17 +253,19 @@ Future<void> _triggerNaggingLogic(String title, String body, {required bool shou
 
         await flutterLocalNotificationsPlugin.zonedSchedule(
           uniqueId, 
-          "$title (נודניק $i)",
-          body,
+          "$title (חזרה $i)",
+          "התראה לא נקראה! $body",
           scheduledTime,
           NotificationDetails(android: androidDetails), 
-          // שימוש ב-exactAllowWhileIdle חיוני לאנדרואיד 12+
-          androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle,
+          
+          // חזרה לשימוש ב-AlarmClock - הדרך היחידה להעיר את המסך בוודאות
+          androidScheduleMode: AndroidScheduleMode.alarmClock,
+          
           uiLocalNotificationDateInterpretation:
               UILocalNotificationDateInterpretation.absoluteTime,
         );
       }
-      await AppLogger.log("SCHED", "Scheduled $nagRepeatCount repeats (IDs ${nagBaseNotificationId + 1}-${nagBaseNotificationId + nagRepeatCount})");
+      await AppLogger.log("SCHED", "Scheduled backup alarms in AlarmClock mode");
     } catch (e) {
       await AppLogger.log("ERR_SCHED", "Schedule failed: $e");
     }
@@ -327,10 +351,13 @@ class _InitScreenState extends State<InitScreen> {
         const InitializationSettings(android: androidSettings),
         onDidReceiveNotificationResponse: (details) {
             AppLogger.log("UI", "User tapped notification");
+            // אם המשתמש לחץ על כפתור "עצור" בנוטיפיקציה
+            if (details.actionId == 'stop_action') {
+               flutterLocalNotificationsPlugin.cancelAll();
+            }
         }
       );
       
-      // בקשת הרשאות קריטיות באתחול
       await _requestPermissions();
 
       FirebaseMessaging.onBackgroundMessage(_firebaseMessagingBackgroundHandler);
@@ -358,14 +385,12 @@ class _InitScreenState extends State<InitScreen> {
   Future<void> _requestPermissions() async {
     await Permission.notification.request();
     
-    // טיפול מיוחד ב-Exact Alarms לאנדרואיד 13+
     if (Platform.isAndroid) {
       final androidPlugin = flutterLocalNotificationsPlugin
           .resolvePlatformSpecificImplementation<
               AndroidFlutterLocalNotificationsPlugin>();
       
       await androidPlugin?.requestNotificationsPermission();
-      // זה יבקש הרשאה אם היא חסרה או יכוון להגדרות במקרים מסוימים
       await androidPlugin?.requestExactAlarmsPermission();
     }
     
@@ -410,7 +435,7 @@ class _BeeperScreenState extends State<BeeperScreen> with WidgetsBindingObserver
       _triggerNaggingLogic(
         msg.data['title'] ?? msg.notification?.title ?? "הודעה",
         msg.data['body'] ?? msg.notification?.body ?? "תוכן הודעה",
-        shouldSaveHistory: true // הודעה אמיתית - לשמור!
+        shouldSaveHistory: true 
       );
       _loadMessages();
     });
@@ -440,7 +465,7 @@ class _BeeperScreenState extends State<BeeperScreen> with WidgetsBindingObserver
 
   Future<void> _loadMessages() async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.reload(); // טעינה מחדש קריטית לעדכון מהיר של המסך
+    await prefs.reload(); 
     final history = prefs.getStringList('beeper_history') ?? [];
     setState(() {
       _messages = history.map((e) => jsonDecode(e) as Map<String, dynamic>).toList();
@@ -448,7 +473,7 @@ class _BeeperScreenState extends State<BeeperScreen> with WidgetsBindingObserver
   }
 
   Future<void> _stopBeeper() async {
-    // הפונקציה הזו מבטלת הכל - גם את ה-ID 0 וגם את כל הטווח של הנודניקים
+    // הפונקציה הזו מבטלת הכל ועוצרת את הלופ האינסופי
     await flutterLocalNotificationsPlugin.cancelAll();
     AppLogger.log("ACTION", "User stopped beeper (CancelAll)");
     
@@ -473,10 +498,9 @@ class _BeeperScreenState extends State<BeeperScreen> with WidgetsBindingObserver
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(content: Text("מבצע בדיקה..."), duration: Duration(seconds: 1))
     );
-    // בדיקה יזומה - לשמור בהיסטוריה! (true)
     await _triggerNaggingLogic(
       "בדיקה עצמית", 
-      "בדיקת מערכת סאונד והתראות (5 חזרות)",
+      "בדיקת צפצוף רציף (Insistent Mode)",
       shouldSaveHistory: true 
     );
     _loadMessages();
@@ -712,7 +736,7 @@ class _PermissionsDialogState extends State<PermissionsDialog> {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             _buildRow("התראות", Permission.notification),
-            _buildRow("תזמון מדויק (חובה לנדנוד)", Permission.scheduleExactAlarm),
+            _buildRow("תזמון מדויק (חובה)", Permission.scheduleExactAlarm),
             _buildRow("החרגת סוללה", Permission.ignoreBatteryOptimizations),
             
             const SizedBox(height: 15),
@@ -860,7 +884,7 @@ class _SettingsPageState extends State<SettingsPage> {
 
   Future<void> _load() async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.reload(); // Ensure fresh load
+    await prefs.reload(); 
     setState(() {
       _start = prefs.getInt('quiet_start_hour') ?? -1;
       _end = prefs.getInt('quiet_end_hour') ?? -1;
@@ -950,8 +974,8 @@ class _SettingsPageState extends State<SettingsPage> {
                 ),
                 const Divider(color: Colors.grey),
                 ListTile(
-                  title: const Text("תדירות נדנוד", style: TextStyle(color: Colors.greenAccent)),
-                  subtitle: const Text("כל כמה זמן הביפר יצפצף?"),
+                  title: const Text("תדירות נדנוד (גיבוי)", style: TextStyle(color: Colors.greenAccent)),
+                  subtitle: const Text("כל כמה זמן תזכורת?"),
                   trailing: DropdownButton<int>(
                     value: _frequencySeconds,
                     dropdownColor: Colors.grey[900],
@@ -977,7 +1001,7 @@ class _SettingsPageState extends State<SettingsPage> {
                 ListTile(
                   title: const Text("צליל נבחר", style: TextStyle(color: Colors.white)),
                   subtitle: Text(
-                    _soundUri != null ? "מותאם אישית" : "ברירת מחדל של האפליקציה",
+                    _soundUri != null ? "מותאם אישית" : "ברירת מחדל של המערכת (חזק)",
                     style: const TextStyle(color: Colors.grey, fontSize: 12)
                   ),
                   trailing: Row(
