@@ -1,0 +1,94 @@
+name: Build Flutter APK
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Java
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.19.0'
+          channel: 'stable'
+
+      - name: Clean and Re-generate Android Project
+        run: |
+          echo "Starting clean regeneration..."
+          
+          # יצירת תיקיות גיבוי
+          mkdir -p temp_backup/app
+          mkdir -p temp_backup/kotlin_src
+          
+          # 1. גיבוי קבצי קונפיגורציה
+          cp android/build.gradle temp_backup/ 2>/dev/null || :
+          cp android/settings.gradle temp_backup/ 2>/dev/null || :
+          
+          cp android/app/build.gradle temp_backup/app/
+          cp android/app/src/main/AndroidManifest.xml temp_backup/app/
+          
+          # --- תיקון: גיבוי הקוד של MainActivity ---
+          # אנחנו חייבים לשמור על הקובץ הזה כי הוא מכיל את הלוגיקה של הרינגטונים!
+          if [ -f "android/app/src/main/kotlin/com/example/alerts/MainActivity.kt" ]; then
+            echo "Backing up MainActivity.kt..."
+            cp android/app/src/main/kotlin/com/example/alerts/MainActivity.kt temp_backup/kotlin_src/
+          else
+            echo "WARNING: MainActivity.kt not found for backup!"
+          fi
+          
+          # 2. מחיקת תיקיית אנדרואיד (הריסת הפרויקט הישן)
+          rm -rf android
+          
+          # 3. יצירה מחדש של הפרויקט
+          flutter create . --project-name alerts --org com.example --platforms android
+          
+          # שדרוג Gradle Wrapper ל-8.2 (חובה עבור ה-plugins החדשים)
+          sed -i 's/gradle-.*-all.zip/gradle-8.2-all.zip/g' android/gradle/wrapper/gradle-wrapper.properties
+          
+          # 4. שחזור הקבצים שגיבינו
+          echo "Restoring configuration files..."
+          cp temp_backup/build.gradle android/build.gradle
+          cp temp_backup/settings.gradle android/settings.gradle
+          cp temp_backup/app/build.gradle android/app/build.gradle
+          cp temp_backup/app/AndroidManifest.xml android/app/src/main/AndroidManifest.xml
+          
+          # --- תיקון: שחזור MainActivity ---
+          if [ -f "temp_backup/kotlin_src/MainActivity.kt" ]; then
+            echo "Restoring MainActivity.kt..."
+            # מוודאים שהתיקייה קיימת (למקרה ש-flutter create שינה משהו)
+            mkdir -p android/app/src/main/kotlin/com/example/alerts
+            cp temp_backup/kotlin_src/MainActivity.kt android/app/src/main/kotlin/com/example/alerts/MainActivity.kt
+          fi
+          
+          echo "Android project regenerated successfully with custom MainActivity."
+
+      - name: Decode Google Services JSON
+        env:
+          GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+        run: |
+          echo "$GOOGLE_SERVICES_JSON" | base64 --decode > android/app/google-services.json
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Build APK
+        run: flutter build apk --release
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: beeper-app-release
+          path: build/app/outputs/flutter-apk/app-release.apk
+          retention-days: 5
