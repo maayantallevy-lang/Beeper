@@ -39,8 +39,7 @@ jobs:
           cp android/app/build.gradle temp_backup/app/
           cp android/app/src/main/AndroidManifest.xml temp_backup/app/
           
-          # --- תיקון: גיבוי הקוד של MainActivity ---
-          # אנחנו חייבים לשמור על הקובץ הזה כי הוא מכיל את הלוגיקה של הרינגטונים!
+          # --- גיבוי קוד נייטיב קריטי ---
           if [ -f "android/app/src/main/kotlin/com/example/alerts/MainActivity.kt" ]; then
             echo "Backing up MainActivity.kt..."
             cp android/app/src/main/kotlin/com/example/alerts/MainActivity.kt temp_backup/kotlin_src/
@@ -48,31 +47,31 @@ jobs:
             echo "WARNING: MainActivity.kt not found for backup!"
           fi
           
-          # 2. מחיקת תיקיית אנדרואיד (הריסת הפרויקט הישן)
+          # 2. מחיקת תיקיית אנדרואיד
           rm -rf android
           
           # 3. יצירה מחדש של הפרויקט
           flutter create . --project-name alerts --org com.example --platforms android
           
-          # שדרוג Gradle Wrapper ל-8.2 (חובה עבור ה-plugins החדשים)
+          # שדרוג Gradle Wrapper
           sed -i 's/gradle-.*-all.zip/gradle-8.2-all.zip/g' android/gradle/wrapper/gradle-wrapper.properties
           
-          # 4. שחזור הקבצים שגיבינו
+          # 4. שחזור הקבצים
           echo "Restoring configuration files..."
           cp temp_backup/build.gradle android/build.gradle
           cp temp_backup/settings.gradle android/settings.gradle
           cp temp_backup/app/build.gradle android/app/build.gradle
           cp temp_backup/app/AndroidManifest.xml android/app/src/main/AndroidManifest.xml
           
-          # --- תיקון: שחזור MainActivity ---
+          # --- שחזור MainActivity ---
           if [ -f "temp_backup/kotlin_src/MainActivity.kt" ]; then
             echo "Restoring MainActivity.kt..."
-            # מוודאים שהתיקייה קיימת (למקרה ש-flutter create שינה משהו)
+            # וידוא שהתיקייה קיימת
             mkdir -p android/app/src/main/kotlin/com/example/alerts
             cp temp_backup/kotlin_src/MainActivity.kt android/app/src/main/kotlin/com/example/alerts/MainActivity.kt
           fi
           
-          echo "Android project regenerated successfully with custom MainActivity."
+          echo "Android project regenerated successfully with preserved Native Code."
 
       - name: Decode Google Services JSON
         env:
