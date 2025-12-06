@@ -300,7 +300,7 @@ class _InitScreenState extends State<InitScreen> {
       await Firebase.initializeApp();
       
       // Fixed Icon Definition
-      const androidSettings = AndroidInitializationSettings('ic_launcher');
+      const androidSettings = AndroidInitializationSettings('@mipmap/ic_launcher');
       
       await flutterLocalNotificationsPlugin.initialize(
         const InitializationSettings(android: androidSettings),
