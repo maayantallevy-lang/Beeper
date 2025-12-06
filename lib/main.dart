@@ -1,7 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'dart:typed_data'; 
+import 'dart:typed_data'; // חיוני עבור Int32List
 import 'package:flutter/services.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
@@ -23,16 +23,18 @@ import 'package:uuid/uuid.dart';
 final FlutterLocalNotificationsPlugin flutterLocalNotificationsPlugin =
     FlutterLocalNotificationsPlugin();
 
-// שיניתי את שם הערוץ כדי להכריח את אנדרואיד ליצור הגדרות סאונד חדשות
-const String baseChannelId = 'critical_alert_insistent_v1';
-const String baseChannelName = 'אזעקת חירום';
-const String channelDesc = 'התראות בלופ אינסופי עד למענה';
+// שיניתי את ה-ID כדי להבטיח יצירה מחדש של הערוץ עם ההגדרות המעודכנות
+const String baseChannelId = 'critical_alert_loop_final'; 
+const String baseChannelName = 'אזעקה רציפה';
+const String channelDesc = 'משמיע סאונד בלופ עד לביטול ידני';
 
 const MethodChannel platformChannel = MethodChannel('com.example.alerts/ringtone');
 
 const int immediateNotificationId = 0; 
-const int nagBaseNotificationId = 1000;
-const int nagRepeatCount = 5; 
+
+// FLAG_INSISTENT = 4
+// זהו הדגל הקריטי שגורם לאנדרואיד לחזור על הסאונד שוב ושוב
+const int androidInsistentFlag = 4; 
 
 // -----------------------------------------------------------------------------
 // LOGGING SYSTEM
@@ -76,7 +78,7 @@ Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
   await Firebase.initializeApp();
   await AppLogger.log("BG_MSG", "Received: ${message.messageId}");
   
-  await _triggerNaggingLogic(
+  await _triggerInfiniteLoopLogic(
     message.data['title'] ?? message.notification?.title ?? "הודעת ביפר",
     message.data['body'] ?? message.notification?.body ?? "התקבלה הודעה חדשה",
     shouldSaveHistory: true
@@ -110,12 +112,12 @@ Future<void> _configureLocalTimeZone() async {
 }
 
 // -----------------------------------------------------------------------------
-// NAGGING LOGIC (THE ENGINE) - INSISTENT MODE
+// INFINITE LOOP LOGIC (NO NAGGING, JUST ONE STRONG ALERT)
 // -----------------------------------------------------------------------------
 
-Future<void> _triggerNaggingLogic(String title, String body, {required bool shouldSaveHistory}) async {
+Future<void> _triggerInfiniteLoopLogic(String title, String body, {required bool shouldSaveHistory}) async {
   await _configureLocalTimeZone();
-  await AppLogger.log("ALERT", "Starting logic: $title (Save=$shouldSaveHistory)");
+  await AppLogger.log("ALERT", "Starting INFINITE LOOP: $title");
   
   final prefs = await SharedPreferences.getInstance();
   await prefs.reload();
@@ -135,19 +137,18 @@ Future<void> _triggerNaggingLogic(String title, String body, {required bool shou
     await prefs.setStringList('beeper_history', history);
   }
 
-  // 2. טעינת הגדרות
+  // 2. טעינת הגדרות (התעלמות מתדירות נדנוד כי אין יותר נדנוד)
   bool isQuietTime = _checkQuietHours(prefs);
   bool isGlobalSilent = prefs.getBool('is_global_silent') ?? false;
   bool isVibrationEnabled = prefs.getBool('is_vibration_enabled') ?? true;
-  int frequencySeconds = prefs.getInt('nag_frequency_seconds') ?? 60;
   String? customSoundUri = prefs.getString('custom_sound_uri');
   
   AndroidNotificationDetails androidDetails;
   
   if (isQuietTime || isGlobalSilent) {
-    // במצב שקט - אין סאונד
+    // מצב שקט: התראה רגילה ללא סאונד וללא לופ
     androidDetails = AndroidNotificationDetails(
-      'silent_channel_v1',
+      'silent_channel_loop_v1',
       'התראות שקטות',
       importance: Importance.high,
       priority: Priority.high,
@@ -158,7 +159,6 @@ Future<void> _triggerNaggingLogic(String title, String body, {required bool shou
     String currentChannelId = baseChannelId;
     AndroidNotificationSound? soundObj;
     
-    // אם אין סאונד מותאם אישית, נשתמש בסאונד ברירת מחדל של *שעון מעורר* (חזק יותר)
     if (customSoundUri != null && customSoundUri.isNotEmpty) {
       currentChannelId = "${baseChannelId}_${customSoundUri.hashCode}";
       soundObj = UriAndroidNotificationSound(customSoundUri);
@@ -168,19 +168,19 @@ Future<void> _triggerNaggingLogic(String title, String body, {required bool shou
         .resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>();
         
     try {
-      // מחיקת הערוץ הישן כדי להבטיח שהגדרות הסאונד יתפסו
+      // מחיקת ערוץ ישן כדי לוודא שהגדרות האודיו (Alarm) יתפסו
       await androidPlugin?.deleteNotificationChannel(currentChannelId);
-      
+
       await androidPlugin?.createNotificationChannel(
         AndroidNotificationChannel(
           currentChannelId,
           baseChannelName,
           description: channelDesc,
-          importance: Importance.max, // מקסימלי
+          importance: Importance.max,
           playSound: true,
           sound: soundObj, 
           enableVibration: isVibrationEnabled,
-          // שינוי קריטי: שימוש בערוץ אודיו של אזעקה, לא של התראות
+          // חיוני: שימוש בערוץ Alarm עוקף מצבי "נא לא להפריע" סטנדרטיים
           audioAttributesUsage: AudioAttributesUsage.alarm, 
         )
       );
@@ -188,87 +188,60 @@ Future<void> _triggerNaggingLogic(String title, String body, {required bool shou
       await AppLogger.log("ERR_CHAN", "Channel create: $e");
     }
 
-    // הגדרות "אלימות" להתראה
+    // הגדרת ההתראה ה"עקשנית"
     androidDetails = AndroidNotificationDetails(
       currentChannelId,
       baseChannelName,
       channelDescription: channelDesc,
       importance: Importance.max,
       priority: Priority.max,
-      fullScreenIntent: true,
+      fullScreenIntent: true, // קופץ למסך מלא אם המכשיר נעול
+      category: AndroidNotificationCategory.call, // מדמה שיחה נכנסת
       
-      // שינוי 1: קטגוריית "שיחה" גורמת לאנדרואיד להתייחס לזה בדחיפות עליונה
-      category: AndroidNotificationCategory.call,
+      // --- מנגנון הלופ ---
+      // שימוש ב-FLAG_INSISTENT (4) דרך additionalFlags
+      // זה גורם לאודיו לחזור על עצמו ללא הפסקה
+      additionalFlags: Int32List.fromList(<int>[androidInsistentFlag]),
       
-      // שינוי 2: המפתח להצלחה - הסאונד יחזור על עצמו בלופ עד שהמשתמש יגיב
-      insistent: true,
-      
-      // שינוי 3: ההתראה לא נמחקת בגרירה
-      ongoing: true,
-      autoCancel: false,
+      // מניעת ביטול בטעות
+      ongoing: true,      // לא ניתן למחיקה בגרירה (Swipe)
+      autoCancel: false,  // לא נמחק בלחיצה רגילה
       
       visibility: NotificationVisibility.public,
       audioAttributesUsage: AudioAttributesUsage.alarm,
       playSound: true,
       sound: soundObj,
       enableVibration: isVibrationEnabled,
-      // דפוס רטט אגרסיבי יותר (ארוך-קצר-ארוך)
+      // רטט אגרסיבי: 2 שניות רטט, חצי שניה הפסקה
       vibrationPattern: isVibrationEnabled 
-          ? Int64List.fromList([0, 2000, 500, 2000, 500, 2000]) 
+          ? Int64List.fromList([0, 2000, 500, 2000, 500, 2000, 500, 2000]) 
           : null,
       
-      // דגל נוסף שעוזר לעקוף מצבי חיסכון סוללה
       actions: <AndroidNotificationAction>[
-        const AndroidNotificationAction('stop_action', 'עצור צפצוף',
-            showsUserInterface: true, cancelNotification: true),
+        const AndroidNotificationAction(
+          'stop_action', 
+          'עצור אזעקה', // טקסט ברור לפעולה
+          showsUserInterface: true, 
+          cancelNotification: true // לחיצה כאן תעצור את הלופ
+        ),
       ],
     );
   }
 
-  // 4. התראה מיידית (ID 0)
+  // 3. הצגת ההתראה (אין יותר תזמון עתידי, רק זה)
   try {
+    // אנו מבטלים התראות קודמות כדי למנוע התנגשות סאונד
+    await flutterLocalNotificationsPlugin.cancelAll();
+
     await flutterLocalNotificationsPlugin.show(
       immediateNotificationId, 
       title,
       body,
       NotificationDetails(android: androidDetails),
     );
-    await AppLogger.log("SHOW", "Immediate INSISTENT notification shown");
+    await AppLogger.log("SHOW", "Infinite Loop Notification Started (Insistent)");
   } catch (e) {
-    await AppLogger.log("ERR_SHOW", "Show immediate: $e");
-  }
-
-  // 5. תזמון חזרות (גיבוי למקרה שהמשתמש השתיק את הלופ עם כפתור הווליום)
-  if (!isQuietTime && !isGlobalSilent) {
-    try {
-      for (int i = 1; i <= nagRepeatCount; i++) {
-        await flutterLocalNotificationsPlugin.cancel(nagBaseNotificationId + i);
-      }
-
-      final now = tz.TZDateTime.now(tz.local);
-      
-      for (int i = 1; i <= nagRepeatCount; i++) {
-        final scheduledTime = now.add(Duration(seconds: i * frequencySeconds));
-        final int uniqueId = nagBaseNotificationId + i;
-
-        await flutterLocalNotificationsPlugin.zonedSchedule(
-          uniqueId, 
-          "$title (חזרה $i)",
-          "התראה לא נקראה! $body",
-          scheduledTime,
-          NotificationDetails(android: androidDetails), 
-          
-          // חזרה לשימוש ב-AlarmClock - הדרך היחידה להעיר את המסך בוודאות
-          androidScheduleMode: AndroidScheduleMode.alarmClock,
-          
-          uiLocalNotificationDateInterpretation:
-              UILocalNotificationDateInterpretation.absoluteTime,
-        );
-      }
-      await AppLogger.log("SCHED", "Scheduled backup alarms in AlarmClock mode");
-    } catch (e) {
-      await AppLogger.log("ERR_SCHED", "Schedule failed: $e");
-    }
+    await AppLogger.log("ERR_SHOW", "Show failed: $e");
   }
 }
 
@@ -350,11 +323,9 @@ class _InitScreenState extends State<InitScreen> {
       await flutterLocalNotificationsPlugin.initialize(
         const InitializationSettings(android: androidSettings),
         onDidReceiveNotificationResponse: (details) {
-            AppLogger.log("UI", "User tapped notification");
-            // אם המשתמש לחץ על כפתור "עצור" בנוטיפיקציה
-            if (details.actionId == 'stop_action') {
-               flutterLocalNotificationsPlugin.cancelAll();
-            }
+            AppLogger.log("UI", "User tapped notification / action");
+            // בין אם לחצו על ההתראה או על הכפתור - עוצרים את הרעש
+            flutterLocalNotificationsPlugin.cancelAll();
         }
       );
       
@@ -391,10 +362,9 @@ class _InitScreenState extends State<InitScreen> {
               AndroidFlutterLocalNotificationsPlugin>();
       
       await androidPlugin?.requestNotificationsPermission();
+      // אנו עדיין משאירים את ההרשאות האלו ליתר ביטחון, אך הן פחות קריטיות ללופ הרציף
       await androidPlugin?.requestExactAlarmsPermission();
     }
-    
-    await Permission.scheduleExactAlarm.request();
   }
 
   @override
@@ -432,7 +402,7 @@ class _BeeperScreenState extends State<BeeperScreen> with WidgetsBindingObserver
     
     FirebaseMessaging.onMessage.listen((msg) {
       AppLogger.log("FG_MSG", "Msg received in foreground");
-      _triggerNaggingLogic(
+      _triggerInfiniteLoopLogic(
         msg.data['title'] ?? msg.notification?.title ?? "הודעה",
         msg.data['body'] ?? msg.notification?.body ?? "תוכן הודעה",
         shouldSaveHistory: true 
@@ -473,7 +443,6 @@ class _BeeperScreenState extends State<BeeperScreen> with WidgetsBindingObserver
   }
 
   Future<void> _stopBeeper() async {
-    // הפונקציה הזו מבטלת הכל ועוצרת את הלופ האינסופי
     await flutterLocalNotificationsPlugin.cancelAll();
     AppLogger.log("ACTION", "User stopped beeper (CancelAll)");
     
@@ -498,9 +467,9 @@ class _BeeperScreenState extends State<BeeperScreen> with WidgetsBindingObserver
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(content: Text("מבצע בדיקה..."), duration: Duration(seconds: 1))
     );
-    await _triggerNaggingLogic(
+    await _triggerInfiniteLoopLogic(
       "בדיקה עצמית", 
-      "בדיקת צפצוף רציף (Insistent Mode)",
+      "בדיקת אזעקה רציפה (לופ אינסופי)",
       shouldSaveHistory: true 
     );
     _loadMessages();
@@ -703,6 +672,7 @@ class _PermissionsDialogState extends State<PermissionsDialog> {
 
   Future<void> _check() async {
     final n = await Permission.notification.status;
+    // עדיין בודקים את ההרשאה ליתר ביטחון, למרות שאינה קריטית ללופ ללא תזמון
     final a = await Permission.scheduleExactAlarm.status;
     final b = await Permission.ignoreBatteryOptimizations.status;
     
@@ -736,7 +706,7 @@ class _PermissionsDialogState extends State<PermissionsDialog> {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             _buildRow("התראות", Permission.notification),
-            _buildRow("תזמון מדויק (חובה)", Permission.scheduleExactAlarm),
+            _buildRow("תזמון מדויק (מומלץ)", Permission.scheduleExactAlarm),
             _buildRow("החרגת סוללה", Permission.ignoreBatteryOptimizations),
             
             const SizedBox(height: 15),
@@ -973,20 +943,21 @@ class _SettingsPageState extends State<SettingsPage> {
                   activeColor: Colors.greenAccent,
                 ),
                 const Divider(color: Colors.grey),
+                // שמרתי את ההגדרה בתצוגה אך היא לא עושה כלום כרגע כי אין תזמון
                 ListTile(
-                  title: const Text("תדירות נדנוד (גיבוי)", style: TextStyle(color: Colors.greenAccent)),
-                  subtitle: const Text("כל כמה זמן תזכורת?"),
+                  title: const Text("תדירות נדנוד", style: TextStyle(color: Colors.grey)), // צבע אפור כי לא פעיל
+                  subtitle: const Text("לא בשימוש (מצב לופ רציף)"),
                   trailing: DropdownButton<int>(
                     value: _frequencySeconds,
                     dropdownColor: Colors.grey[900],
-                    style: const TextStyle(color: Colors.greenAccent),
+                    style: const TextStyle(color: Colors.grey),
                     items: const [
                       DropdownMenuItem(value: 30, child: Text("30 שניות")),
                       DropdownMenuItem(value: 60, child: Text("1 דקה")),
                       DropdownMenuItem(value: 120, child: Text("2 דקות")),
                       DropdownMenuItem(value: 300, child: Text("5 דקות")),
                     ],
-                    onChanged: _setFrequency,
+                    onChanged: _setFrequency, // משאיר את הפונקציונליות כדי לא לשבור קוד, אבל זה לא ישפיע
                   ),
                 ),
               ],
