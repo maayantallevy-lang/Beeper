@@ -17,7 +17,7 @@ import 'package:flutter_timezone/flutter_timezone.dart';
 import 'package:uuid/uuid.dart';
 
 // -----------------------------------------------------------------------------
-// GLOBAL OBJECTS
+// GLOBAL OBJECTS & CONSTANTS
 // -----------------------------------------------------------------------------
 
 final FlutterLocalNotificationsPlugin flutterLocalNotificationsPlugin =
@@ -28,6 +28,11 @@ const String baseChannelName = 'התראות חירום';
 const String channelDesc = 'ערוץ להודעות דחופות עם עקיפת שקט';
 
 const MethodChannel platformChannel = MethodChannel('com.example.alerts/ringtone');
+
+// הגדרות למנגנון הנדנוד המתוקן
+const int immediateNotificationId = 0; // ID להתראה הראשונה
+const int nagBaseNotificationId = 1000; // בסיס להתראות הנודניק (1001, 1002...)
+const int nagRepeatCount = 5; // כמה פעמים לנדנד
 
 // -----------------------------------------------------------------------------
 // LOGGING SYSTEM
@@ -106,7 +111,7 @@ Future<void> _configureLocalTimeZone() async {
 }
 
 // -----------------------------------------------------------------------------
-// NAGGING LOGIC (THE ENGINE)
+// NAGGING LOGIC (THE ENGINE) - FIXED VERSION
 // -----------------------------------------------------------------------------
 
 Future<void> _triggerNaggingLogic(String title, String body, {required bool shouldSaveHistory}) async {
@@ -200,37 +205,43 @@ Future<void> _triggerNaggingLogic(String title, String body, {required bool shou
   // 4. התראה מיידית (ID 0)
   try {
     await flutterLocalNotificationsPlugin.show(
-      0, 
+      immediateNotificationId, 
       title,
       body,
       NotificationDetails(android: androidDetails),
     );
+    await AppLogger.log("SHOW", "Immediate notification shown");
   } catch (e) {
     await AppLogger.log("ERR_SHOW", "Show immediate: $e");
   }
 
-  // 5. תזמון חזרות (נודניק)
+  // 5. תזמון חזרות (נודניק) - מתוקן
   if (!isQuietTime && !isGlobalSilent) {
     try {
-      // ביטול תזמונים קודמים כדי למנוע כפילויות
-      await flutterLocalNotificationsPlugin.cancel(1); 
+      // ניקוי תזמונים קודמים כדי למנוע חפיפות
+      for (int i = 1; i <= nagRepeatCount; i++) {
+        await flutterLocalNotificationsPlugin.cancel(nagBaseNotificationId + i);
+      }
 
       final now = tz.TZDateTime.now(tz.local);
-      for (int i = 1; i <= 5; i++) {
+      
+      for (int i = 1; i <= nagRepeatCount; i++) {
         final scheduledTime = now.add(Duration(seconds: i * frequencySeconds));
-        
+        final int uniqueId = nagBaseNotificationId + i;
+
         await flutterLocalNotificationsPlugin.zonedSchedule(
-          1, // שימוש באותו ID (1) לכל החזרות כדי שידרסו זו את זו ולא יערמו
+          uniqueId, 
           "$title (נודניק $i)",
           body,
           scheduledTime,
           NotificationDetails(android: androidDetails), 
-          androidScheduleMode: AndroidScheduleMode.alarmClock,
+          // שימוש ב-exactAllowWhileIdle חיוני לאנדרואיד 12+
+          androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle,
           uiLocalNotificationDateInterpretation:
               UILocalNotificationDateInterpretation.absoluteTime,
         );
       }
-      await AppLogger.log("SCHED", "Scheduled 5 repeats every $frequencySeconds sec");
+      await AppLogger.log("SCHED", "Scheduled $nagRepeatCount repeats (IDs ${nagBaseNotificationId + 1}-${nagBaseNotificationId + nagRepeatCount})");
     } catch (e) {
       await AppLogger.log("ERR_SCHED", "Schedule failed: $e");
     }
@@ -319,8 +330,8 @@ class _InitScreenState extends State<InitScreen> {
         }
       );
       
-      await Permission.notification.request();
-      await Permission.scheduleExactAlarm.request();
+      // בקשת הרשאות קריטיות באתחול
+      await _requestPermissions();
 
       FirebaseMessaging.onBackgroundMessage(_firebaseMessagingBackgroundHandler);
       
@@ -342,6 +353,23 @@ class _InitScreenState extends State<InitScreen> {
       });
       AppLogger.log("FATAL", "Init failed: $e");
     }
+  }
+
+  Future<void> _requestPermissions() async {
+    await Permission.notification.request();
+    
+    // טיפול מיוחד ב-Exact Alarms לאנדרואיד 13+
+    if (Platform.isAndroid) {
+      final androidPlugin = flutterLocalNotificationsPlugin
+          .resolvePlatformSpecificImplementation<
+              AndroidFlutterLocalNotificationsPlugin>();
+      
+      await androidPlugin?.requestNotificationsPermission();
+      // זה יבקש הרשאה אם היא חסרה או יכוון להגדרות במקרים מסוימים
+      await androidPlugin?.requestExactAlarmsPermission();
+    }
+    
+    await Permission.scheduleExactAlarm.request();
   }
 
   @override
@@ -420,8 +448,9 @@ class _BeeperScreenState extends State<BeeperScreen> with WidgetsBindingObserver
   }
 
   Future<void> _stopBeeper() async {
+    // הפונקציה הזו מבטלת הכל - גם את ה-ID 0 וגם את כל הטווח של הנודניקים
     await flutterLocalNotificationsPlugin.cancelAll();
-    AppLogger.log("ACTION", "User stopped beeper");
+    AppLogger.log("ACTION", "User stopped beeper (CancelAll)");
     
     final prefs = await SharedPreferences.getInstance();
     await prefs.reload();
@@ -447,7 +476,7 @@ class _BeeperScreenState extends State<BeeperScreen> with WidgetsBindingObserver
     // בדיקה יזומה - לשמור בהיסטוריה! (true)
     await _triggerNaggingLogic(
       "בדיקה עצמית", 
-      "בדיקת מערכת סאונד והתראות",
+      "בדיקת מערכת סאונד והתראות (5 חזרות)",
       shouldSaveHistory: true 
     );
     _loadMessages();
@@ -683,7 +712,7 @@ class _PermissionsDialogState extends State<PermissionsDialog> {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             _buildRow("התראות", Permission.notification),
-            _buildRow("תזמון מדויק", Permission.scheduleExactAlarm),
+            _buildRow("תזמון מדויק (חובה לנדנוד)", Permission.scheduleExactAlarm),
             _buildRow("החרגת סוללה", Permission.ignoreBatteryOptimizations),
             
             const SizedBox(height: 15),
@@ -707,8 +736,6 @@ class _PermissionsDialogState extends State<PermissionsDialog> {
   Widget _buildRow(String name, Permission perm) {
     final status = _statuses[perm] ?? PermissionStatus.denied;
     bool isOk = status == PermissionStatus.granted;
-    // עבור סוללה, באנדרואיד לעיתים קרובות הסטטוס מדווח כ-Denied גם כשאפשר לבקש
-    // לכן אנו מאפשרים ללחוץ על הכפתור תמיד אם זה לא Granted
     
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 8.0),
@@ -726,9 +753,7 @@ class _PermissionsDialogState extends State<PermissionsDialog> {
                   padding: const EdgeInsets.symmetric(horizontal: 8)
                 ),
                 onPressed: () async {
-                  // לוגיקה משופרת: אם הבקשה נכשלת או שזו סוללה, פתח הגדרות ישירות
                   if (perm == Permission.ignoreBatteryOptimizations) {
-                     // ניסיון ראשון לבקשה סטנדרטית
                      final result = await perm.request();
                      if (result != PermissionStatus.granted) {
                        await openAppSettings();
@@ -739,7 +764,6 @@ class _PermissionsDialogState extends State<PermissionsDialog> {
                       await openAppSettings();
                     }
                   }
-                  // הטיימר ירענן את המצב
                 },
                 child: const Text(
                   "אשר / הגדרות", 
