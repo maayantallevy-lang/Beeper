@@ -1,7 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'dart:typed_data';
+import 'dart:typed_data'; 
 import 'package:flutter/services.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
@@ -17,76 +17,48 @@ import 'package:flutter_timezone/flutter_timezone.dart';
 import 'package:uuid/uuid.dart';
 
 // -----------------------------------------------------------------------------
-// LOGGING SYSTEM
-// -----------------------------------------------------------------------------
-
-class AppLogger {
-  static const String _key = 'beeper_logs_v_final';
-
-  static Future<void> log(String message) async {
-    final String timestamp = DateFormat('HH:mm:ss').format(DateTime.now());
-    final String entry = "[$timestamp] $message";
-    print("LOG: $entry");
-
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.reload();
-      final List<String> logs = prefs.getStringList(_key) ?? [];
-      logs.insert(0, entry);
-      if (logs.length > 300) logs.removeRange(300, logs.length);
-      await prefs.setStringList(_key, logs);
-    } catch (e) {
-      print("Log Error: $e");
-    }
-  }
-
-  static Future<List<String>> getLogs() async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.reload();
-    return prefs.getStringList(_key) ?? [];
-  }
-
-  static Future<void> clear() async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.remove(_key);
-  }
-}
-
-// -----------------------------------------------------------------------------
 // GLOBAL OBJECTS
 // -----------------------------------------------------------------------------
 
 final FlutterLocalNotificationsPlugin flutterLocalNotificationsPlugin =
     FlutterLocalNotificationsPlugin();
 
-const String baseChannelName = 'התראות ביפר';
-const String channelDesc = 'ערוץ חירום';
+const String baseChannelId = 'critical_alert_channel_prod';
+const String baseChannelName = 'התראות חירום';
+const String channelDesc = 'ערוץ להודעות דחופות עם עקיפת שקט';
+
 const MethodChannel platformChannel = MethodChannel('com.example.alerts/ringtone');
 
 // -----------------------------------------------------------------------------
-// HELPER: INITIALIZE
+// LOGGING SYSTEM
 // -----------------------------------------------------------------------------
 
-Future<void> _ensureNotificationInit() async {
-  // 1. הגדרת Timezone דינמית מהמכשיר - קריטי לנודניק
-  tz.initializeTimeZones();
-  try {
-    final String timeZoneName = await FlutterTimezone.getLocalTimezone();
-    tz.setLocalLocation(tz.getLocation(timeZoneName));
-  } catch (e) {
-    try { tz.setLocalLocation(tz.getLocation('UTC')); } catch (_) {}
+class AppLogger {
+  static const _key = 'app_internal_logs';
+  
+  static Future<void> log(String type, String message) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      List<String> logs = prefs.getStringList(_key) ?? [];
+      
+      final timestamp = DateFormat('dd/MM HH:mm:ss').format(DateTime.now());
+      final entry = "$timestamp [$type] $message";
+      
+      // Keep only last 200 logs to save memory
+      logs.insert(0, entry);
+      if (logs.length > 200) logs = logs.sublist(0, 200);
+      
+      await prefs.setStringList(_key, logs);
+      print("LOG: $entry"); // Also print to console
+    } catch (e) {
+      print("Logging Error: $e");
+    }
   }
 
-  // 2. הגדרת אייקון - התיקון הקריטי: רק השם, ללא נתיב!
-  const androidSettings = AndroidInitializationSettings('ic_launcher');
-  const initSettings = InitializationSettings(android: androidSettings);
-  
-  await flutterLocalNotificationsPlugin.initialize(
-    initSettings,
-    onDidReceiveNotificationResponse: (details) {
-      AppLogger.log("Notification Tapped");
-    },
-  );
+  static Future<List<String>> getLogs() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getStringList(_key) ?? [];
+  }
 }
 
 // -----------------------------------------------------------------------------
@@ -96,11 +68,11 @@ Future<void> _ensureNotificationInit() async {
 @pragma('vm:entry-point')
 Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
   await Firebase.initializeApp();
-  await AppLogger.log("BG MSG: ${message.data}");
-  await _ensureNotificationInit();
+  await AppLogger.log("BG_MSG", "Received: ${message.messageId}");
+  
   await _triggerNaggingLogic(
-    message.data['title'] ?? "ביפר",
-    message.data['body'] ?? "הודעה חדשה"
+    message.data['title'] ?? message.notification?.title ?? "הודעת ביפר",
+    message.data['body'] ?? message.notification?.body ?? "התקבלה הודעה חדשה"
   );
 }
 
@@ -109,11 +81,22 @@ Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
 // -----------------------------------------------------------------------------
 
 void main() {
-  runZonedGuarded(() {
+  runZonedGuarded(() async {
     WidgetsFlutterBinding.ensureInitialized();
+    
+    // Timezone setup using flutter_timezone for correct local time
+    tz.initializeTimeZones();
+    try {
+      final String currentTimeZone = await FlutterTimezone.getLocalTimezone();
+      tz.setLocalLocation(tz.getLocation(currentTimeZone));
+    } catch (e) {
+      // Fallback to UTC if something fails
+      tz.setLocalLocation(tz.getLocation('UTC'));
+    }
+
     runApp(const BeeperApp());
   }, (error, stack) {
-    AppLogger.log("CRASH: $error");
+    AppLogger.log("CRASH", "Main error: $error");
   });
 }
 
@@ -122,17 +105,10 @@ void main() {
 // -----------------------------------------------------------------------------
 
 Future<void> _triggerNaggingLogic(String title, String body) async {
-  await AppLogger.log(">>> ALERT START: $title");
-  
-  try {
-    final String timeZoneName = await FlutterTimezone.getLocalTimezone();
-    tz.setLocalLocation(tz.getLocation(timeZoneName));
-  } catch (_) {}
-
+  await AppLogger.log("ALERT", "Starting logic for: $title");
   final prefs = await SharedPreferences.getInstance();
-  await prefs.reload();
-
-  // History
+  
+  // 1. History Save
   final messageData = {
     'id': const Uuid().v4(),
     'title': title,
@@ -140,91 +116,79 @@ Future<void> _triggerNaggingLogic(String title, String body) async {
     'timestamp': DateTime.now().toIso8601String(),
     'read': false,
   };
+  
   List<String> history = prefs.getStringList('beeper_history') ?? [];
   history.insert(0, jsonEncode(messageData));
   await prefs.setStringList('beeper_history', history);
 
-  // Settings
+  // 2. User Settings
   bool isQuietTime = _checkQuietHours(prefs);
   bool isGlobalSilent = prefs.getBool('is_global_silent') ?? false;
-  bool isInQuietMode = isQuietTime || isGlobalSilent;
-
-  // חישוב שניות (אם לא הוגדר עדיין, ברירת מחדל 30 שניות)
-  int frequencySeconds = prefs.getInt('nag_frequency_seconds') ?? 30;
-  if (frequencySeconds <= 0) frequencySeconds = 30;
-
+  // Frequency is stored in SECONDS now for better precision (30s support)
+  int frequencySeconds = prefs.getInt('nag_frequency_seconds') ?? 60;
   String? customSoundUri = prefs.getString('custom_sound_uri');
-  bool enableVibrate;
-  bool playSound;
-
-  if (isInQuietMode) {
-    enableVibrate = prefs.getBool('quiet_vibrate_enabled') ?? true;
-    playSound = false;
-    await AppLogger.log("Mode: QUIET");
-  } else {
-    enableVibrate = prefs.getBool('normal_vibrate_enabled') ?? true;
-    playSound = true;
-    await AppLogger.log("Mode: NORMAL");
-  }
-
-  // Channel ID (v20 - clean slate without LED)
-  String settingsHash = "${isInQuietMode}_${enableVibrate}_${customSoundUri.hashCode}";
-  String dynamicChannelId = "beeper_v20_$settingsHash";
-
-  AndroidNotificationSound? soundObj;
-  if (playSound && customSoundUri != null && customSoundUri.isNotEmpty) {
-    soundObj = UriAndroidNotificationSound(customSoundUri);
-  }
-
-  Int64List? vibrationPattern;
-  if (enableVibrate) {
-    // רטט חזק: 0 המתנה, 1000 רטט...
-    vibrationPattern = Int64List.fromList([0, 1000, 500, 1000]);
-  }
-
-  final androidPlugin = flutterLocalNotificationsPlugin
-      .resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>();
-      
-  try {
-    await androidPlugin?.createNotificationChannel(
-      AndroidNotificationChannel(
-        dynamicChannelId,
-        baseChannelName,
-        description: channelDesc,
-        importance: Importance.max,
-        playSound: playSound,
-        sound: soundObj, 
-        enableVibration: enableVibrate,
-        vibrationPattern: vibrationPattern,
-        enableLights: false, // בוטל לחלוטין
-        audioAttributesUsage: AudioAttributesUsage.alarm,
-      )
+  
+  AndroidNotificationDetails androidDetails;
+  
+  // 3. Build Channel
+  if (isQuietTime || isGlobalSilent) {
+    androidDetails = const AndroidNotificationDetails(
+      'silent_channel_prod',
+      'התראות שקטות',
+      importance: Importance.high,
+      priority: Priority.high,
+      playSound: false,
+      enableVibration: true,
     );
-  } catch (e) {
-    await AppLogger.log("ChanErr: $e");
+    await AppLogger.log("MODE", "Silent mode active");
+  } else {
+    String currentChannelId = baseChannelId;
+    
+    AndroidNotificationSound? soundObj;
+    if (customSoundUri != null && customSoundUri.isNotEmpty) {
+      currentChannelId = "${baseChannelId}_${customSoundUri.hashCode}";
+      soundObj = UriAndroidNotificationSound(customSoundUri);
+    }
+
+    final androidPlugin = flutterLocalNotificationsPlugin
+        .resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>();
+        
+    try {
+      await androidPlugin?.createNotificationChannel(
+        AndroidNotificationChannel(
+          currentChannelId,
+          baseChannelName,
+          description: channelDesc,
+          importance: Importance.max,
+          playSound: true,
+          sound: soundObj, 
+          enableVibration: true,
+          audioAttributesUsage: AudioAttributesUsage.alarm,
+        )
+      );
+    } catch (e) {
+      await AppLogger.log("ERR_CHAN", "Channel create: $e");
+    }
+
+    // REMOVED LED/LIGHTS CONFIGURATION AS REQUESTED
+    androidDetails = AndroidNotificationDetails(
+      currentChannelId,
+      baseChannelName,
+      channelDescription: channelDesc,
+      importance: Importance.max,
+      priority: Priority.max,
+      fullScreenIntent: true,
+      category: AndroidNotificationCategory.alarm,
+      visibility: NotificationVisibility.public,
+      audioAttributesUsage: AudioAttributesUsage.alarm,
+      playSound: true,
+      sound: soundObj,
+      enableVibration: true,
+      vibrationPattern: Int64List.fromList([0, 1000, 500, 1000, 500, 1000]),
+    );
   }
 
-  final androidDetails = AndroidNotificationDetails(
-    dynamicChannelId,
-    baseChannelName,
-    channelDescription: channelDesc,
-    importance: Importance.max,
-    priority: Priority.max,
-    fullScreenIntent: true,
-    category: AndroidNotificationCategory.alarm,
-    visibility: NotificationVisibility.public,
-    audioAttributesUsage: AudioAttributesUsage.alarm,
-    playSound: playSound,
-    sound: soundObj,
-    enableVibration: enableVibrate,
-    vibrationPattern: vibrationPattern,
-    enableLights: false,
-    ongoing: true,
-    autoCancel: false,
-    ticker: title,
-  );
-
-  // 1. Immediate Notification
+  // 4. Immediate Notification
   try {
     await flutterLocalNotificationsPlugin.show(
       0,
@@ -232,35 +196,32 @@ Future<void> _triggerNaggingLogic(String title, String body) async {
       body,
       NotificationDetails(android: androidDetails),
     );
-    await AppLogger.log("Immediate Sent");
   } catch (e) {
-    await AppLogger.log("Immediate FAIL: $e");
+    await AppLogger.log("ERR_SHOW", "Show immediate: $e");
   }
 
-  // 2. Nagging Loop (Repeating Alarm)
-  bool shouldNag = (playSound || enableVibrate);
-  if (shouldNag) {
+  // 5. Schedule Repetitions (AlarmClock Mode)
+  if (!isQuietTime && !isGlobalSilent) {
     try {
-      final now = tz.TZDateTime.now(tz.local); 
-      for (int i = 1; i <= 10; i++) { 
-        // חישוב זמן עתידי מדויק בשניות
-        final scheduledTime = now.add(Duration(seconds: (i * frequencySeconds) + 2));
+      final now = tz.TZDateTime.now(tz.local);
+      for (int i = 1; i <= 5; i++) {
+        final scheduledTime = now.add(Duration(seconds: i * frequencySeconds));
         
         await flutterLocalNotificationsPlugin.zonedSchedule(
-          i + 1000,
-          "$title (נודניק $i)",
+          i + 100,
+          "$title (חזרה $i)",
           body,
           scheduledTime,
           NotificationDetails(android: androidDetails),
-          // שימוש ב-alarmClock הוא היחיד שיעיר מכשירי שיאומי במצב שינה
+          // CRITICAL: AlarmClock mode for Doze/Battery saver bypass
           androidScheduleMode: AndroidScheduleMode.alarmClock,
           uiLocalNotificationDateInterpretation:
               UILocalNotificationDateInterpretation.absoluteTime,
         );
       }
-      await AppLogger.log("Scheduled 10 nags (Every ${frequencySeconds}s)");
+      await AppLogger.log("SCHED", "Scheduled 5 repeats every $frequencySeconds sec");
     } catch (e) {
-      await AppLogger.log("Schedule FAIL: $e");
+      await AppLogger.log("ERR_SCHED", "Schedule failed: $e");
     }
   }
 }
@@ -336,24 +297,31 @@ class _InitScreenState extends State<InitScreen> {
 
   Future<void> _initializeApp() async {
     try {
-      await AppLogger.log("=== APP INIT ===");
       await Firebase.initializeApp();
       
-      await _ensureNotificationInit();
+      // Fixed Icon Definition
+      const androidSettings = AndroidInitializationSettings('ic_launcher');
       
-      // בקשת הרשאות קריטיות
+      await flutterLocalNotificationsPlugin.initialize(
+        const InitializationSettings(android: androidSettings),
+        onDidReceiveNotificationResponse: (details) {
+            AppLogger.log("UI", "User tapped notification");
+        }
+      );
+      
+      // Initial Basic Permission Request
       await [
         Permission.notification,
         Permission.scheduleExactAlarm,
-        Permission.ignoreBatteryOptimizations, // חובה לשיאומי!
       ].request();
-      
-      final androidPlugin = flutterLocalNotificationsPlugin
-          .resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>();
-      await androidPlugin?.requestNotificationsPermission();
 
       FirebaseMessaging.onBackgroundMessage(_firebaseMessagingBackgroundHandler);
-      await FirebaseMessaging.instance.subscribeToTopic('all_users');
+      
+      try {
+        await FirebaseMessaging.instance.subscribeToTopic('all_users');
+      } catch (e) {
+        AppLogger.log("SUB_ERR", "Topic subscribe failed: $e");
+      }
 
       if (mounted) {
         Navigator.pushReplacement(
@@ -361,11 +329,11 @@ class _InitScreenState extends State<InitScreen> {
         );
       }
     } catch (e) {
-      await AppLogger.log("INIT ERROR: $e");
       setState(() {
         _hasError = true;
-        _status = "שגיאה: $e";
+        _status = "שגיאה קריטית באתחול:\n$e";
       });
+      AppLogger.log("FATAL", "Init failed: $e");
     }
   }
 
@@ -373,16 +341,9 @@ class _InitScreenState extends State<InitScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       body: Center(
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            if (!_hasError) const CircularProgressIndicator(color: Colors.greenAccent),
-            if (_hasError) Padding(
-              padding: const EdgeInsets.all(20.0),
-              child: Text(_status, textAlign: TextAlign.center, style: const TextStyle(color: Colors.red)),
-            ),
-          ],
-        ),
+        child: _hasError 
+          ? Text(_status, textAlign: TextAlign.center, style: const TextStyle(color: Colors.red))
+          : const CircularProgressIndicator(color: Colors.greenAccent),
       ),
     );
   }
@@ -397,21 +358,32 @@ class BeeperScreen extends StatefulWidget {
 
 class _BeeperScreenState extends State<BeeperScreen> with WidgetsBindingObserver {
   List<Map<String, dynamic>> _messages = [];
+  bool _isSubscribed = false; 
   
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _loadMessages();
+    _ensureSubscription();
     
     FirebaseMessaging.onMessage.listen((msg) {
-      AppLogger.log("FG MSG: ${msg.data}");
+      AppLogger.log("FG_MSG", "Msg received in foreground");
       _triggerNaggingLogic(
-        msg.data['title'] ?? "הודעה",
-        msg.data['body'] ?? "תוכן הודעה"
+        msg.data['title'] ?? msg.notification?.title ?? "הודעה",
+        msg.data['body'] ?? msg.notification?.body ?? "תוכן הודעה"
       );
       _loadMessages();
     });
+  }
+
+  Future<void> _ensureSubscription() async {
+    try {
+      await FirebaseMessaging.instance.subscribeToTopic('all_users');
+      setState(() => _isSubscribed = true);
+    } catch (e) {
+      setState(() => _isSubscribed = false);
+    }
   }
 
   @override
@@ -427,7 +399,6 @@ class _BeeperScreenState extends State<BeeperScreen> with WidgetsBindingObserver
 
   Future<void> _loadMessages() async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.reload();
     final history = prefs.getStringList('beeper_history') ?? [];
     setState(() {
       _messages = history.map((e) => jsonDecode(e) as Map<String, dynamic>).toList();
@@ -435,8 +406,8 @@ class _BeeperScreenState extends State<BeeperScreen> with WidgetsBindingObserver
   }
 
   Future<void> _stopBeeper() async {
-    await AppLogger.log("STOP CLICKED");
     await flutterLocalNotificationsPlugin.cancelAll();
+    AppLogger.log("ACTION", "User stopped beeper");
     
     final prefs = await SharedPreferences.getInstance();
     List<String> history = prefs.getStringList('beeper_history') ?? [];
@@ -460,55 +431,59 @@ class _BeeperScreenState extends State<BeeperScreen> with WidgetsBindingObserver
     _loadMessages();
   }
 
-  Future<void> _runSelfTest() async {
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text("מבצע בדיקה..."), duration: Duration(seconds: 1))
-    );
-    await _triggerNaggingLogic("בדיקה עצמית", "התראה זו מדמה התראת אמת מהשרת");
-    _loadMessages();
-  }
+  Future<void> _checkAndRequestPermissions() async {
+    Map<Permission, PermissionStatus> statuses = await [
+      Permission.notification,
+      Permission.scheduleExactAlarm,
+      Permission.ignoreBatteryOptimizations,
+    ].request();
 
-  Future<void> _checkAllPermissions() async {
-    StringBuffer report = StringBuffer();
-    
-    var notifStatus = await Permission.notification.status;
-    report.writeln("Notifications: $notifStatus");
-    if (!notifStatus.isGranted) await Permission.notification.request();
-
-    var alarmStatus = await Permission.scheduleExactAlarm.status;
-    report.writeln("Alarm (Snooze): $alarmStatus");
-    if (!alarmStatus.isGranted) await Permission.scheduleExactAlarm.request();
-
-    var batteryStatus = await Permission.ignoreBatteryOptimizations.status;
-    report.writeln("Battery: $batteryStatus");
-    if (!batteryStatus.isGranted) {
-       await Permission.ignoreBatteryOptimizations.request();
-    }
-
-    await AppLogger.log("PERM CHECK:\n$report");
+    bool batteryOpt = await Permission.ignoreBatteryOptimizations.isGranted;
     
     if (mounted) {
-      showDialog(context: context, builder: (_) => AlertDialog(
-        title: const Text("דוח הרשאות"),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Text(report.toString(), style: const TextStyle(color: Colors.white)),
-            const SizedBox(height: 20),
-            const Text(
-              "במכשירי Xiaomi: חובה לאפשר 'Autostart' בהגדרות האפליקציה!",
-              style: TextStyle(color: Colors.orange, fontWeight: FontWeight.bold),
-            ),
-            const SizedBox(height: 10),
-            ElevatedButton(
-              onPressed: () => openAppSettings(),
-              child: const Text("פתח הגדרות אפליקציה"),
+      showDialog(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          backgroundColor: Colors.grey[900],
+          title: const Text("סטטוס הרשאות", style: TextStyle(color: Colors.white)),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              _permRow("התראות", statuses[Permission.notification]),
+              _permRow("תזמון מדויק", statuses[Permission.scheduleExactAlarm]),
+              _permRow("החרגת סוללה (Doze)", statuses[Permission.ignoreBatteryOptimizations]),
+              const SizedBox(height: 10),
+              if (!batteryOpt)
+                 const Text(
+                  "הערה: חובה לאשר 'החרגת סוללה' כדי שהביפר יעבוד כשהמסך כבוי במכשירי שיאומי/סמסונג.",
+                  style: TextStyle(color: Colors.orange, fontSize: 12),
+                ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text("סגור"),
             )
           ],
-        ),
-        backgroundColor: Colors.grey[900],
-      ));
+        )
+      );
     }
+  }
+
+  Widget _permRow(String name, PermissionStatus? status) {
+    bool isOk = status == PermissionStatus.granted;
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4.0),
+      child: Row(
+        children: [
+          Icon(isOk ? Icons.check_circle : Icons.error, color: isOk ? Colors.green : Colors.red, size: 16),
+          const SizedBox(width: 8),
+          Text(name, style: TextStyle(color: isOk ? Colors.greenAccent : Colors.redAccent)),
+        ],
+      ),
+    );
   }
 
   @override
@@ -517,16 +492,18 @@ class _BeeperScreenState extends State<BeeperScreen> with WidgetsBindingObserver
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text("BEEPER SYSTEM", style: TextStyle(letterSpacing: 2)),
+        title: const Text("BEEPER // PROD", style: TextStyle(letterSpacing: 2)),
         centerTitle: true,
         leading: IconButton(
-          icon: const Icon(Icons.assignment, color: Colors.yellowAccent),
-          onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const LogViewerScreen())),
+          icon: const Icon(Icons.shield_outlined, color: Colors.orangeAccent),
+          onPressed: _checkAndRequestPermissions,
+          tooltip: "בדיקת הרשאות",
         ),
         actions: [
           IconButton(
-            icon: const Icon(Icons.shield, color: Colors.blueAccent),
-            onPressed: _checkAllPermissions,
+             icon: const Icon(Icons.list_alt, color: Colors.cyanAccent),
+             onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const LogsScreen())),
+             tooltip: "יומן אירועים",
           ),
           IconButton(
             icon: const Icon(Icons.settings),
@@ -554,48 +531,23 @@ class _BeeperScreenState extends State<BeeperScreen> with WidgetsBindingObserver
           
           Padding(
             padding: const EdgeInsets.all(16.0),
-            child: Row(
-              children: [
-                Expanded(
-                  child: SizedBox(
-                    height: 80,
-                    child: ElevatedButton.icon(
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: Colors.grey[800],
-                        foregroundColor: Colors.redAccent,
-                        side: const BorderSide(color: Colors.redAccent, width: 2),
-                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(4)),
-                      ),
-                      onPressed: _stopBeeper,
-                      icon: const Icon(Icons.notifications_off, size: 32),
-                      label: const Text(
-                        "עצור / קראתי",
-                        style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)
-                      ),
-                    ),
-                  ),
+            child: SizedBox(
+              height: 80,
+              width: double.infinity,
+              child: ElevatedButton.icon(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.grey[800],
+                  foregroundColor: Colors.redAccent,
+                  side: const BorderSide(color: Colors.redAccent, width: 2),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(4)),
                 ),
-                const SizedBox(width: 10),
-                SizedBox(
-                  height: 80,
-                  width: 80,
-                  child: ElevatedButton(
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: Colors.blueGrey[800],
-                      foregroundColor: Colors.white,
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(4)),
-                    ),
-                    onPressed: _runSelfTest,
-                    child: const Column(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        Icon(Icons.volume_up),
-                        Text("בדיקה", style: TextStyle(fontSize: 10)),
-                      ],
-                    ),
-                  ),
+                onPressed: _stopBeeper,
+                icon: const Icon(Icons.notifications_off, size: 32),
+                label: const Text(
+                  "עצור / קראתי",
+                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)
                 ),
-              ],
+              ),
             ),
           ),
 
@@ -663,76 +615,55 @@ class _BeeperScreenState extends State<BeeperScreen> with WidgetsBindingObserver
 }
 
 // -----------------------------------------------------------------------------
-// LOG VIEWER WITH COPY
+// LOGS SCREEN
 // -----------------------------------------------------------------------------
 
-class LogViewerScreen extends StatefulWidget {
-  const LogViewerScreen({super.key});
+class LogsScreen extends StatefulWidget {
+  const LogsScreen({super.key});
 
   @override
-  State<LogViewerScreen> createState() => _LogViewerScreenState();
+  State<LogsScreen> createState() => _LogsScreenState();
 }
 
-class _LogViewerScreenState extends State<LogViewerScreen> {
-  List<String> logs = [];
+class _LogsScreenState extends State<LogsScreen> {
+  List<String> _logs = [];
 
   @override
   void initState() {
     super.initState();
-    _loadLogs();
+    _load();
   }
 
-  Future<void> _loadLogs() async {
+  Future<void> _load() async {
     final l = await AppLogger.getLogs();
-    setState(() => logs = l);
-  }
-
-  Future<void> _copyLogs() async {
-    final text = logs.join('\n');
-    await Clipboard.setData(ClipboardData(text: text));
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("הלוג הועתק ללוח"), backgroundColor: Colors.white, duration: Duration(seconds: 1)),
-      );
-    }
+    setState(() => _logs = l);
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text("יומן מערכת"),
+        title: const Text("יומן אירועים טכני"),
         actions: [
           IconButton(
-            icon: const Icon(Icons.copy, color: Colors.cyanAccent), 
-            onPressed: _copyLogs,
+            icon: const Icon(Icons.copy),
+            onPressed: () {
+              Clipboard.setData(ClipboardData(text: _logs.join("\n")));
+              ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("הלוג הועתק")));
+            },
           ),
-          IconButton(icon: const Icon(Icons.refresh), onPressed: _loadLogs),
-          IconButton(icon: const Icon(Icons.delete), onPressed: () async {
-            await AppLogger.clear();
-            _loadLogs();
-          }),
+          IconButton(
+            icon: const Icon(Icons.refresh),
+            onPressed: _load,
+          )
         ],
       ),
-      body: Container(
-        color: Colors.black,
-        child: ListView.builder(
-          itemCount: logs.length,
-          padding: const EdgeInsets.all(10),
-          itemBuilder: (context, index) {
-            final log = logs[index];
-            Color color = Colors.greenAccent;
-            if (log.contains("FAIL") || log.contains("ERROR") || log.contains("CRASH")) {
-              color = Colors.redAccent;
-            } else if (log.contains("BG MSG")) {
-              color = Colors.orangeAccent;
-            }
-            
-            return Padding(
-              padding: const EdgeInsets.only(bottom: 8.0),
-              child: SelectableText(log, style: TextStyle(color: color, fontFamily: 'Courier', fontSize: 12)),
-            );
-          },
+      body: ListView.builder(
+        padding: const EdgeInsets.all(8),
+        itemCount: _logs.length,
+        itemBuilder: (ctx, i) => Text(
+          _logs[i], 
+          style: const TextStyle(fontFamily: 'Courier', fontSize: 12, color: Colors.greenAccent)
         ),
       ),
     );
@@ -753,11 +684,8 @@ class SettingsPage extends StatefulWidget {
 class _SettingsPageState extends State<SettingsPage> {
   int _start = -1, _end = -1;
   bool _isGlobalSilent = false;
-  int _frequencySeconds = 30; 
+  int _frequencySeconds = 60;
   String? _soundUri;
-
-  bool _normVib = true;
-  bool _quietVib = true;
 
   @override
   void initState() {
@@ -771,17 +699,9 @@ class _SettingsPageState extends State<SettingsPage> {
       _start = prefs.getInt('quiet_start_hour') ?? -1;
       _end = prefs.getInt('quiet_end_hour') ?? -1;
       _isGlobalSilent = prefs.getBool('is_global_silent') ?? false;
-      _frequencySeconds = prefs.getInt('nag_frequency_seconds') ?? 30;
+      _frequencySeconds = prefs.getInt('nag_frequency_seconds') ?? 60;
       _soundUri = prefs.getString('custom_sound_uri');
-      _normVib = prefs.getBool('normal_vibrate_enabled') ?? true;
-      _quietVib = prefs.getBool('quiet_vibrate_enabled') ?? true;
     });
-  }
-
-  Future<void> _saveBool(String key, bool val) async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool(key, val);
-    _load();
   }
 
   Future<void> _setHour(String key) async {
@@ -793,13 +713,13 @@ class _SettingsPageState extends State<SettingsPage> {
     }
   }
 
-  Future<void> _toggleGlobalSilent(bool val) async {
+  Future<void> _toggleSilent(bool val) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool('is_global_silent', val);
     setState(() => _isGlobalSilent = val);
   }
 
-  Future<void> _setFrequencySeconds(int? val) async {
+  Future<void> _setFrequency(int? val) async {
     if (val != null) {
       final prefs = await SharedPreferences.getInstance();
       await prefs.setInt('nag_frequency_seconds', val);
@@ -817,12 +737,10 @@ class _SettingsPageState extends State<SettingsPage> {
         final prefs = await SharedPreferences.getInstance();
         await prefs.setString('custom_sound_uri', result);
         setState(() => _soundUri = result);
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text("צלצול עודכן"), backgroundColor: Colors.green)
-        );
+        AppLogger.log("SETTING", "Ringtone changed");
       }
     } on PlatformException catch (e) {
-      print("Error picking ringtone: ${e.message}");
+      AppLogger.log("ERR", "Pick ringtone: ${e.message}");
     }
   }
 
@@ -839,30 +757,56 @@ class _SettingsPageState extends State<SettingsPage> {
       body: ListView(
         padding: const EdgeInsets.all(20),
         children: [
-          _buildHeader("מצב רגיל"),
+          _buildHeader("הגדרות התראה"),
           _buildCard(
             child: Column(
               children: [
                 SwitchListTile(
-                  title: const Text("רטט", style: TextStyle(color: Colors.white)),
-                  value: _normVib,
-                  onChanged: (v) => _saveBool('normal_vibrate_enabled', v),
+                  title: const Text("מצב שקט תמידי", style: TextStyle(color: Colors.greenAccent, fontWeight: FontWeight.bold)),
+                  value: _isGlobalSilent,
+                  onChanged: _toggleSilent,
                   activeColor: Colors.greenAccent,
                 ),
-                const Divider(height: 1, color: Colors.grey),
+                const Divider(color: Colors.grey),
+                ListTile(
+                  title: const Text("תדירות נדנוד", style: TextStyle(color: Colors.greenAccent)),
+                  subtitle: const Text("כל כמה זמן הביפר יצפצף?"),
+                  trailing: DropdownButton<int>(
+                    value: _frequencySeconds,
+                    dropdownColor: Colors.grey[900],
+                    style: const TextStyle(color: Colors.greenAccent),
+                    items: const [
+                      DropdownMenuItem(value: 30, child: Text("30 שניות")),
+                      DropdownMenuItem(value: 60, child: Text("1 דקה")),
+                      DropdownMenuItem(value: 120, child: Text("2 דקות")),
+                      DropdownMenuItem(value: 300, child: Text("5 דקות")),
+                    ],
+                    onChanged: _setFrequency,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          
+          const SizedBox(height: 30),
+          _buildHeader("צליל התראה"),
+          _buildCard(
+            child: Column(
+              children: [
                 ListTile(
                   title: const Text("צליל נבחר", style: TextStyle(color: Colors.white)),
                   subtitle: Text(
-                    _soundUri != null ? "מותאם אישית" : "ברירת מחדל",
+                    _soundUri != null ? "מותאם אישית" : "ברירת מחדל של האפליקציה",
                     style: const TextStyle(color: Colors.grey, fontSize: 12)
                   ),
                   trailing: Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      IconButton(
-                        icon: const Icon(Icons.refresh, color: Colors.orange),
-                        onPressed: _resetSound,
-                      ),
+                      if (_soundUri != null)
+                        IconButton(
+                          icon: const Icon(Icons.refresh, color: Colors.orange),
+                          onPressed: _resetSound,
+                        ),
                       IconButton(
                         icon: const Icon(Icons.notifications_active, color: Colors.greenAccent),
                         onPressed: _openSystemRingtonePicker,
@@ -874,30 +818,7 @@ class _SettingsPageState extends State<SettingsPage> {
             ),
           ),
 
-          const SizedBox(height: 20),
-          _buildHeader("מצב שקט"),
-          _buildCard(
-            child: Column(
-              children: [
-                 SwitchListTile(
-                  title: const Text("שקט תמידי", style: TextStyle(color: Colors.greenAccent, fontWeight: FontWeight.bold)),
-                  subtitle: const Text("מתעלם משעות - המכשיר תמיד בשקט"),
-                  value: _isGlobalSilent,
-                  onChanged: _toggleGlobalSilent,
-                  activeColor: Colors.greenAccent,
-                ),
-                const Divider(height: 1, color: Colors.grey),
-                SwitchListTile(
-                  title: const Text("רטט בשקט", style: TextStyle(color: Colors.white)),
-                  value: _quietVib,
-                  onChanged: (v) => _saveBool('quiet_vibrate_enabled', v),
-                  activeColor: Colors.orangeAccent,
-                ),
-              ],
-            ),
-          ),
-
-          const SizedBox(height: 20),
+          const SizedBox(height: 30),
           _buildHeader("שעות שקטות"),
           _buildCard(
             child: Column(
@@ -910,7 +831,6 @@ class _SettingsPageState extends State<SettingsPage> {
                   ),
                   onTap: () => _setHour('quiet_start_hour'),
                 ),
-                const Divider(height: 1, color: Colors.grey),
                 ListTile(
                   title: const Text("סיום", style: TextStyle(color: Colors.white)),
                   trailing: Text(
@@ -923,27 +843,7 @@ class _SettingsPageState extends State<SettingsPage> {
             ),
           ),
           
-          const SizedBox(height: 20),
-          _buildHeader("כללי"),
-           _buildCard(
-            child: ListTile(
-              title: const Text("תדירות נודניק", style: TextStyle(color: Colors.white)),
-              trailing: DropdownButton<int>(
-                value: _frequencySeconds,
-                dropdownColor: Colors.grey[900],
-                style: const TextStyle(color: Colors.greenAccent),
-                items: const [
-                  DropdownMenuItem(value: 30, child: Text("30 שניות (דחוף!)")),
-                  DropdownMenuItem(value: 60, child: Text("דקה אחת")),
-                  DropdownMenuItem(value: 120, child: Text("2 דקות")),
-                  DropdownMenuItem(value: 300, child: Text("5 דקות")),
-                ],
-                onChanged: _setFrequencySeconds,
-              ),
-            ),
-           ),
-
-          if (_start != -1)
+           if (_start != -1)
             Padding(
               padding: const EdgeInsets.only(top: 20.0),
               child: Center(
