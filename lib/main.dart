@@ -83,19 +83,23 @@ Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
 void main() {
   runZonedGuarded(() async {
     WidgetsFlutterBinding.ensureInitialized();
-    
-    tz.initializeTimeZones();
-    try {
-      final String currentTimeZone = await FlutterTimezone.getLocalTimezone();
-      tz.setLocalLocation(tz.getLocation(currentTimeZone));
-    } catch (e) {
-      tz.setLocalLocation(tz.getLocation('UTC'));
-    }
-
+    await _configureLocalTimeZone();
     runApp(const BeeperApp());
   }, (error, stack) {
     AppLogger.log("CRASH", "Main error: $error");
   });
+}
+
+Future<void> _configureLocalTimeZone() async {
+  try {
+    tz.initializeTimeZones();
+    final String currentTimeZone = await FlutterTimezone.getLocalTimezone();
+    tz.setLocalLocation(tz.getLocation(currentTimeZone));
+  } catch (e) {
+    try {
+      tz.setLocalLocation(tz.getLocation('UTC'));
+    } catch (_) {}
+  }
 }
 
 // -----------------------------------------------------------------------------
@@ -103,6 +107,7 @@ void main() {
 // -----------------------------------------------------------------------------
 
 Future<void> _triggerNaggingLogic(String title, String body) async {
+  await _configureLocalTimeZone();
   await AppLogger.log("ALERT", "Starting logic for: $title");
   final prefs = await SharedPreferences.getInstance();
   
@@ -122,8 +127,6 @@ Future<void> _triggerNaggingLogic(String title, String body) async {
   // 2. User Settings
   bool isQuietTime = _checkQuietHours(prefs);
   bool isGlobalSilent = prefs.getBool('is_global_silent') ?? false;
-  
-  // --- New: Vibration Check ---
   bool isVibrationEnabled = prefs.getBool('is_vibration_enabled') ?? true;
 
   int frequencySeconds = prefs.getInt('nag_frequency_seconds') ?? 60;
@@ -139,7 +142,7 @@ Future<void> _triggerNaggingLogic(String title, String body) async {
       importance: Importance.high,
       priority: Priority.high,
       playSound: false,
-      enableVibration: isVibrationEnabled, // Respect setting even in silent mode? Usually silent implies vibration only, but let's respect user choice if they turned it off completely.
+      enableVibration: isVibrationEnabled,
     );
     await AppLogger.log("MODE", "Silent mode active");
   } else {
@@ -184,7 +187,6 @@ Future<void> _triggerNaggingLogic(String title, String body) async {
       playSound: true,
       sound: soundObj,
       enableVibration: isVibrationEnabled,
-      // Only set pattern if vibration is enabled
       vibrationPattern: isVibrationEnabled 
           ? Int64List.fromList([0, 1000, 500, 1000, 500, 1000]) 
           : null,
@@ -203,7 +205,7 @@ Future<void> _triggerNaggingLogic(String title, String body) async {
     await AppLogger.log("ERR_SHOW", "Show immediate: $e");
   }
 
-  // 5. Schedule Repetitions (AlarmClock Mode)
+  // 5. Schedule Repetitions
   if (!isQuietTime && !isGlobalSilent) {
     try {
       final now = tz.TZDateTime.now(tz.local);
@@ -310,7 +312,6 @@ class _InitScreenState extends State<InitScreen> {
         }
       );
       
-      // Initial request for basic notifications
       await Permission.notification.request();
       await Permission.scheduleExactAlarm.request();
 
@@ -396,7 +397,9 @@ class _BeeperScreenState extends State<BeeperScreen> with WidgetsBindingObserver
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed) _loadMessages();
+    if (state == AppLifecycleState.resumed) {
+      _loadMessages();
+    }
   }
 
   Future<void> _loadMessages() async {
@@ -434,7 +437,6 @@ class _BeeperScreenState extends State<BeeperScreen> with WidgetsBindingObserver
         duration: Duration(seconds: 1)
       )
     );
-    
     await _triggerNaggingLogic("בדיקה עצמית", "בדיקת מערכת סאונד והתראות");
     _loadMessages();
   }
@@ -445,88 +447,10 @@ class _BeeperScreenState extends State<BeeperScreen> with WidgetsBindingObserver
     _loadMessages();
   }
 
-  Future<void> _checkAndRequestPermissions() async {
-    // Check current statuses first
-    PermissionStatus notifStatus = await Permission.notification.status;
-    PermissionStatus alarmStatus = await Permission.scheduleExactAlarm.status;
-    PermissionStatus batteryStatus = await Permission.ignoreBatteryOptimizations.status;
-
-    if (mounted) {
-      showDialog(
-        context: context,
-        builder: (ctx) => StatefulBuilder(
-          builder: (context, setState) {
-            return AlertDialog(
-              backgroundColor: Colors.grey[900],
-              title: const Text("ניהול הרשאות", style: TextStyle(color: Colors.white)),
-              content: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  _buildPermRow("התראות", Permission.notification, notifStatus, setState),
-                  _buildPermRow("תזמון מדויק", Permission.scheduleExactAlarm, alarmStatus, setState),
-                  _buildPermRow("החרגת סוללה", Permission.ignoreBatteryOptimizations, batteryStatus, setState),
-                  
-                  const SizedBox(height: 15),
-                  if (batteryStatus != PermissionStatus.granted)
-                     const Text(
-                      "הערה: 'החרגת סוללה' קריטית לקבלת התראות כשהמסך כבוי.",
-                      style: TextStyle(color: Colors.orange, fontSize: 12),
-                    ),
-                ],
-              ),
-              actions: [
-                TextButton(
-                  onPressed: () => Navigator.pop(ctx),
-                  child: const Text("סגור"),
-                )
-              ],
-            );
-          }
-        )
-      );
-    }
-  }
-
-  Widget _buildPermRow(String name, Permission perm, PermissionStatus currentStatus, StateSetter refreshState) {
-    bool isOk = currentStatus == PermissionStatus.granted;
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 8.0),
-      child: Row(
-        children: [
-          Icon(isOk ? Icons.check_circle : Icons.error, color: isOk ? Colors.green : Colors.red, size: 20),
-          const SizedBox(width: 10),
-          Expanded(child: Text(name, style: const TextStyle(color: Colors.white))),
-          if (!isOk)
-            SizedBox(
-              height: 30,
-              child: ElevatedButton(
-                style: ElevatedButton.styleFrom(backgroundColor: Colors.greenAccent, padding: const EdgeInsets.symmetric(horizontal: 8)),
-                onPressed: () async {
-                  // Request the permission
-                  await perm.request();
-                  // Check status again
-                  var newStatus = await perm.status;
-                  // If blocked/permanently denied, we might need to open settings
-                  if (newStatus.isPermanentlyDenied) {
-                    openAppSettings();
-                  }
-                  
-                  // Refresh the Dialog UI
-                  refreshState(() {
-                    // We can't easily update the outer variable 'currentStatus' here without logic,
-                    // so we trigger a re-build which should ideally re-fetch or use a state object.
-                    // For simplicity in this structure, we'll just close and re-open or let the user re-open.
-                    // A better way is below:
-                  });
-                  Navigator.pop(context); // Close dialog to force user to re-open to see changes or refresh properly
-                  _checkAndRequestPermissions(); // Re-open with fresh status
-                },
-                child: const Text("אשר", style: TextStyle(color: Colors.black, fontSize: 12)),
-              ),
-            )
-        ],
-      ),
+  void _checkAndRequestPermissions() {
+    showDialog(
+      context: context,
+      builder: (_) => const PermissionsDialog(),
     );
   }
 
@@ -684,6 +608,141 @@ class _BeeperScreenState extends State<BeeperScreen> with WidgetsBindingObserver
 }
 
 // -----------------------------------------------------------------------------
+// DYNAMIC PERMISSIONS DIALOG
+// -----------------------------------------------------------------------------
+
+class PermissionsDialog extends StatefulWidget {
+  const PermissionsDialog({super.key});
+
+  @override
+  State<PermissionsDialog> createState() => _PermissionsDialogState();
+}
+
+class _PermissionsDialogState extends State<PermissionsDialog> with WidgetsBindingObserver {
+  Map<Permission, PermissionStatus> _statuses = {};
+  bool _loading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _check();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  // זו הנקודה הקריטית: כשחוזרים לאפליקציה (למשל מההגדרות), בודקים שוב
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _check();
+    }
+  }
+
+  Future<void> _check() async {
+    final n = await Permission.notification.status;
+    final a = await Permission.scheduleExactAlarm.status;
+    final b = await Permission.ignoreBatteryOptimizations.status;
+    
+    if (mounted) {
+      setState(() {
+        _statuses = {
+          Permission.notification: n,
+          Permission.scheduleExactAlarm: a,
+          Permission.ignoreBatteryOptimizations: b,
+        };
+        _loading = false;
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_loading) {
+      return const AlertDialog(
+        backgroundColor: Color(0xFF212121),
+        content: SizedBox(height: 50, child: Center(child: CircularProgressIndicator())),
+      );
+    }
+
+    return AlertDialog(
+      backgroundColor: Colors.grey[900],
+      title: const Text("ניהול הרשאות (חי)", style: TextStyle(color: Colors.white)),
+      content: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            _buildRow("התראות", Permission.notification),
+            _buildRow("תזמון מדויק", Permission.scheduleExactAlarm),
+            _buildRow("החרגת סוללה", Permission.ignoreBatteryOptimizations),
+            
+            const SizedBox(height: 15),
+            if (_statuses[Permission.ignoreBatteryOptimizations] != PermissionStatus.granted)
+               const Text(
+                "הערה: 'החרגת סוללה' קריטית לקבלת התראות כשהמסך כבוי.",
+                style: TextStyle(color: Colors.orange, fontSize: 12),
+              ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text("סגור"),
+        )
+      ],
+    );
+  }
+
+  Widget _buildRow(String name, Permission perm) {
+    final status = _statuses[perm] ?? PermissionStatus.denied;
+    bool isOk = status == PermissionStatus.granted;
+    bool isPermanentlyDenied = status.isPermanentlyDenied || status.isRestricted;
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8.0),
+      child: Row(
+        children: [
+          Icon(isOk ? Icons.check_circle : Icons.error, color: isOk ? Colors.green : Colors.red, size: 20),
+          const SizedBox(width: 10),
+          Expanded(child: Text(name, style: const TextStyle(color: Colors.white))),
+          if (!isOk)
+            SizedBox(
+              height: 30,
+              child: ElevatedButton(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: isPermanentlyDenied ? Colors.orange : Colors.greenAccent, 
+                  padding: const EdgeInsets.symmetric(horizontal: 8)
+                ),
+                onPressed: () async {
+                  if (isPermanentlyDenied) {
+                    await openAppSettings();
+                    // אנחנו לא מרעננים כאן ידנית, כי ה-Listener ב-didChangeAppLifecycleState
+                    // יזהה את החזרה לאפליקציה וירענן לבד!
+                  } else {
+                    await perm.request();
+                    _check(); // רענון מידי במקרה של דיאלוג פנימי
+                  }
+                },
+                child: Text(
+                  isPermanentlyDenied ? "הגדרות" : "אשר", 
+                  style: const TextStyle(color: Colors.black, fontSize: 12)
+                ),
+              ),
+            )
+        ],
+      ),
+    );
+  }
+}
+
+
+// -----------------------------------------------------------------------------
 // LOGS SCREEN
 // -----------------------------------------------------------------------------
 
@@ -753,7 +812,7 @@ class SettingsPage extends StatefulWidget {
 class _SettingsPageState extends State<SettingsPage> {
   int _start = -1, _end = -1;
   bool _isGlobalSilent = false;
-  bool _isVibrationEnabled = true; // New State
+  bool _isVibrationEnabled = true;
   int _frequencySeconds = 60;
   String? _soundUri;
 
@@ -769,7 +828,7 @@ class _SettingsPageState extends State<SettingsPage> {
       _start = prefs.getInt('quiet_start_hour') ?? -1;
       _end = prefs.getInt('quiet_end_hour') ?? -1;
       _isGlobalSilent = prefs.getBool('is_global_silent') ?? false;
-      _isVibrationEnabled = prefs.getBool('is_vibration_enabled') ?? true; // Load
+      _isVibrationEnabled = prefs.getBool('is_vibration_enabled') ?? true;
       _frequencySeconds = prefs.getInt('nag_frequency_seconds') ?? 60;
       _soundUri = prefs.getString('custom_sound_uri');
     });
@@ -790,7 +849,6 @@ class _SettingsPageState extends State<SettingsPage> {
     setState(() => _isGlobalSilent = val);
   }
 
-  // New Toggle for Vibration
   Future<void> _toggleVibration(bool val) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool('is_vibration_enabled', val);
@@ -846,7 +904,6 @@ class _SettingsPageState extends State<SettingsPage> {
                   activeColor: Colors.greenAccent,
                 ),
                 const Divider(color: Colors.grey),
-                // New Switch
                 SwitchListTile(
                   title: const Text("רטט", style: TextStyle(color: Colors.white)),
                   subtitle: const Text("הפעל רטט בעת קבלת התראה"),
