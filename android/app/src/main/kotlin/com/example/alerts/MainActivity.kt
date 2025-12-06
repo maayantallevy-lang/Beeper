@@ -18,18 +18,15 @@ class MainActivity: FlutterActivity() {
         
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL).setMethodCallHandler { call, result ->
             if (call.method == "pickRingtone") {
-                // שמירת ה-Result כדי להחזיר תשובה אחרי שהמשתמש יבחר
                 if (pendingResult != null) {
                     result.error("ALREADY_ACTIVE", "Ringtone picker is already active", null)
                     return@setMethodCallHandler
                 }
                 pendingResult = result
                 
-                // קבלת ה-URI הקיים (אם יש) כדי לסמן אותו כברירת מחדל בפתיחה
                 val existingUriString = call.argument<String>("existingUri")
                 val existingUri = if (existingUriString != null) Uri.parse(existingUriString) else null
 
-                // הפעלת האינטנט המקורי של אנדרואיד לבחירת רינגטון (כולל השמעה!)
                 val intent = Intent(RingtoneManager.ACTION_RINGTONE_PICKER).apply {
                     putExtra(RingtoneManager.EXTRA_RINGTONE_TYPE, RingtoneManager.TYPE_NOTIFICATION)
                     putExtra(RingtoneManager.EXTRA_RINGTONE_SHOW_DEFAULT, true)
@@ -54,10 +51,8 @@ class MainActivity: FlutterActivity() {
         if (requestCode == PICK_RINGTONE_REQUEST) {
             if (resultCode == Activity.RESULT_OK && data != null) {
                 val uri: Uri? = data.getParcelableExtra(RingtoneManager.EXTRA_RINGTONE_PICKED_URI)
-                // החזרת ה-URI (או null אם נבחר "שקט") לקוד ה-Dart
                 pendingResult?.success(uri?.toString())
             } else {
-                // המשתמש ביטל
                 pendingResult?.success(null)
             }
             pendingResult = null
