@@ -2,7 +2,6 @@ plugins {
     id "com.android.application"
     id "kotlin-android"
     id "dev.flutter.flutter-gradle-plugin"
-    // --- חובה: הפלאגין שקורא את google-services.json ---
     id "com.google.gms.google-services"
 }
 
@@ -27,7 +26,7 @@ if (flutterVersionName == null) {
 android {
     namespace "com.example.alerts"
     compileSdkVersion 34
-    // FIX: Set specific NDK version as requested
+    // הגדרה קריטית למניעת שגיאות בנייה
     ndkVersion "25.1.8937393"
 
     compileOptions {
@@ -50,14 +49,11 @@ android {
         targetSdkVersion 34
         versionCode flutterVersionCode.toInteger()
         versionName flutterVersionName
-        
-        // מנגנון ה-MultiDex פעיל
         multiDexEnabled true
     }
 
     buildTypes {
         release {
-            // ביטול כיווץ למניעת בעיות R8
             minifyEnabled false 
             shrinkResources false
             signingConfig signingConfigs.debug
@@ -71,9 +67,7 @@ android {
 }
 
 dependencies {
-    // --- תיקון קריטי: שינמוך לגרסה 1.2.2 שפותר את קריסת ה-JSON Array ב-D8 ---
     coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:1.2.2'
-    
     implementation 'androidx.multidex:multidex:2.0.1'
 }
 
